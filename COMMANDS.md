@@ -15,6 +15,18 @@ The list below covers every supported command.
 
 ## 2. Supported command list (Update it later)
 
+### 2.1 Bitmap
+
+| Command | Notes |
+|---|---|
+| `BITCOUNT` | |
+| `BITFIELD` | |
+| `BITFIELD_RO` | |
+| `BITOP` | The destkey and every srckey must hash to the same slot, otherwise the proxy returns `-CROSSSLOT` without contacting a backend|
+| `BITPOS` | |
+| `GETBIT` | |
+| `SETBIT` | |
+
 ## 3. Fan-out command details
 
 These commands are split per key into several sub-commands sent to each key's owning node, then
