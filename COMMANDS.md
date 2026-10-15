@@ -120,3 +120,45 @@ directly affect command behavior are listed here:
 | `min_acl_connection` / `max_acl_connection` | 0 / 10 | `ACL`/`AUTH`, plus each authenticated client's dedicated per-node connections |
 | `cluster_refresh_interval_ms` | 0 (disabled) | Whether/how often the cluster topology is refreshed in the background |
 | `max_connection` | 4000 | Per-worker-thread fd budget (client sockets + backend connections + listener fd(s)) |
+
+## 8. Unsupported commands
+
+| Command | Notes |
+|---|---|
+| `ASKING` | |
+| `CLUSTER ADDSLOTS` | |
+| `CLUSTER ADDSLOTSRANGE` | |
+| `CLUSTER BUMPEPOCH` | |
+| `CLUSTER CANCELSLOTMIGRATIONS` | |
+| `CLUSTER COUNT-FAILURE-REPORTS` | |
+| `CLUSTER COUNTKEYSINSLOT` | |
+| `CLUSTER DELSLOTS` | |
+| `CLUSTER DELSLOTSRANGE` | |
+| `CLUSTER FAILOVER` | |
+| `CLUSTER FLUSHSLOTS` | |
+| `CLUSTER FORGET` | |
+| `CLUSTER GETKEYSINSLOT` | |
+| `CLUSTER GETSLOTMIGRATIONS` | |
+| `CLUSTER HELP` | |
+| `CLUSTER INFO` | |
+| `CLUSTER KEYSLOT` | |
+| `CLUSTER LINKS` | |
+| `CLUSTER MEET` | |
+| `CLUSTER MIGRATESLOTS` | |
+| `CLUSTER MYID` | |
+| `CLUSTER MYSHARDID` | |
+| `CLUSTER NODES` | |
+| `CLUSTER REPLICAS` | |
+| `CLUSTER REPLICATE` | |
+| `CLUSTER RESET` | |
+| `CLUSTER SAVECONFIG` | |
+| `CLUSTER SET-CONFIG-EPOCH` | |
+| `CLUSTER SETSLOT` | |
+| `CLUSTER SHARDS` | |
+| `CLUSTER SLAVES` | |
+| `CLUSTER SLOT-STATS` | |
+| `CLUSTER SLOTS` | |
+| `CLUSTER SYNCSLOTS` | |
+| `CLUSTERSCAN` | |
+| `READONLY` | |
+| `READWRITE` | |
