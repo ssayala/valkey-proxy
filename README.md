@@ -27,7 +27,9 @@ git config blame.ignoreRevsFile .git-blame-ignore-revs   # skip the bulk-format 
 ```
 
 ## Configuration
-For running it as a Kubernetes sidecar see [docs/KUBERNETES.md](docs/KUBERNETES.md).
+Unknown settings and invalid values stop startup with the file and line number. SIGHUP reloads
+the TLS certificates (and with `tls-auto-reload yes`, the default, changed certificate files are
+picked up automatically). For running it as a Kubernetes sidecar see [docs/KUBERNETES.md](docs/KUBERNETES.md).
 
 Create a `proxy.conf` file before starting the proxy. All four parameters are required
 (`server-ip` and `bind` accept IPv4/IPv6 addresses or hostnames):
@@ -67,6 +69,7 @@ tls-enabled  no
 # tls-backend          yes
 # tls-backend-ca-cert  /etc/ssl/certs/ca.crt   # default: system trust store
 # tls-backend-verify   yes                     # verify the nodes' certificate chain
+# tls-backend-verify-host  no                  # ...and that it names the node (hostname or IP)
 # tls-backend-cert     /etc/ssl/certs/proxy-client.crt   # client cert, if the nodes require one
 # tls-backend-key      /etc/ssl/private/proxy-client.key
 

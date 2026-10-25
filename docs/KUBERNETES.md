@@ -58,10 +58,11 @@ port        7777
 unix-socket /var/run/valkey/proxy.sock
 unix-socket-perm 660              # app container must share the group (fsGroup)
 worker-thread-no 1
-cluster_refresh_interval_ms 5000  # Valkey pods come back on new IPs
+cluster_refresh_interval_ms 2000  # the default; also refreshes on backend errors
 shutdown-timeout 10               # keep below terminationGracePeriodSeconds
 # tls-backend yes
 # tls-backend-ca-cert /etc/valkey-tls/ca.crt
+# tls-backend-verify-host yes   # node certs must name the node's hostname/IP
 ```
 
 ## Notes
@@ -82,6 +83,9 @@ shutdown-timeout 10               # keep below terminationGracePeriodSeconds
   is only reachable from inside the pod's `emptyDir`). Socket paths are
   limited to 107 bytes. The socket is always plaintext; use `tls-enabled`
   only for TCP clients.
+- **Certificate rotation.** With the default `tls-auto-reload yes`, renewed
+  certificates in the mounted secret (cert-manager) are picked up within
+  ~5s without a restart; `kill -HUP` forces it.
 - **Probes.** `PING` is answered by the proxy itself, so it shows the proxy is
   up, not that the cluster is reachable. A keyed command (e.g.
   `GET healthcheck`) exercises the backend path; `tcpSocket` is enough for

@@ -120,11 +120,13 @@ directly affect command behavior are listed here:
 | Setting | Default | Effect |
 |---|---|---|
 | `min_normal_connection` / `max_normal_connection` | 0 / 20 | Pool for commands that still use the one-at-a-time path (most commands use the shared pipelined connections instead); grown on demand in the background |
-| `min_blocking_connection` / `max_blocking_connection` | 0 / 10 | `BLPOP` and other blocking commands; grown on demand |
-| `min_subscription_connection` / `max_subscription_connection` | 0 / 10 | Pub/Sub |
+| `min_blocking_connection` / `max_blocking_connection` | 0 / 1000 | `BLPOP` and other blocking commands (one connection per blocked client); grown on demand |
+| `min_subscription_connection` / `max_subscription_connection` | 0 / 1000 | Pub/Sub (one connection per subscribed client) |
 | `min_transaction_connection` / `max_transaction_connection` | 0 / 10 | Unused: transactions use pinned connections (see 2a) |
-| `min_acl_connection` / `max_acl_connection` | 0 / 10 | `ACL`/`AUTH`, plus each authenticated client's dedicated per-node connections |
-| `cluster_refresh_interval_ms` | 0 (on `MOVED` only) | How often the cluster topology is refreshed in the background; a `MOVED` reply always triggers an immediate refresh |
+| `min_acl_connection` / `max_acl_connection` | 0 / 1000 | `ACL`/`AUTH`, plus each authenticated client's dedicated per-node connections |
+| `cluster_refresh_interval_ms` | 2000 | How often the cluster topology is refreshed in the background; a `MOVED` reply or a failed backend connection also triggers an immediate refresh |
 | `max_command_size` | 512MB | Largest single client command accepted |
 | `verbose` | no | Per-command / per-connection trace logging |
-| `max_connection` | 4000 | Per-worker-thread fd budget (client sockets + backend connections + listener fd(s)) |
+| `max_connection` | 16384 | Process fd budget (client sockets + backend connections + listener fd(s)) |
+| `maxclients` | 10000 | Client connections across all workers; beyond it new clients get `-ERR max number of clients reached` |
+| `client-output-buffer-limit-pubsub` / `-normal` | 32MB / 0 | Disconnect a client whose unsent replies exceed this (0 = no limit) |

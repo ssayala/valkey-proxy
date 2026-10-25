@@ -133,6 +133,12 @@ void handle_sub_conn_readable(Worker *w, PoolConn *conn) {
         memcpy(cl->wbuf + cl->wbuf_len, out, (size_t)out_len);
         cl->wbuf_len += out_len;
         free(downgraded);
+        if (client_check_obuf_limit(w, cl) < 0) {
+            /* Slow subscriber over its limit: stop queueing (the flush
+             * closes it); the rest of this batch is dropped with it. */
+            conn->rbuf_len = 0;
+            return;
+        }
 
         int sub_count = parse_sub_count_from_msg(conn->rbuf + off, rlen);
         off += rlen;

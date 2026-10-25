@@ -119,6 +119,7 @@ void close_client(Worker *w, ClientConn *client) {
  * yet, so there's no safe way to resync framing here -- closing the client
  * is the only option that can't desync the next command's parsing. */
 void client_recover_after_backend_error(Worker *w, ClientConn *client, PoolConn *conn, const char *msg) {
+    topology_request_refresh(); /* the node may have failed over (see mux_fail()) */
     if (client->state == CS_STREAMING_CMD) {
         close_client(w, client);
         return;

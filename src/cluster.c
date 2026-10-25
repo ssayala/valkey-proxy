@@ -180,7 +180,7 @@ static int fetch_cluster_nodes_from(const char *ip, int port, ClusterNode *out_n
      * at 5s that alone would stretch every single cycle out to 5+ seconds,
      * badly slowing down how fast a real failover gets noticed. */
     TlsConn *ssl;
-    int fd = backend_connect_blocking(ip, port, NULL, 0, g_config.backend_connect_timeout_ms, &ssl);
+    int fd = backend_connect_blocking(ip, port, NULL, 0, g_config.backend_connect_timeout_ms, NULL, &ssl);
     if (fd < 0) return -1;
     if (net_write_all(fd, ssl, CLUSTER_NODES_CMD, strlen(CLUSTER_NODES_CMD)) < 0) {
         discovery_close(fd, ssl);
@@ -213,7 +213,7 @@ static int fetch_cluster_nodes_from(const char *ip, int port, ClusterNode *out_n
 void fetch_cluster_nodes(void) {
     printf("Connecting to %s:%d to fetch cluster topology...\n", g_config.server_ip, g_config.server_port);
     TlsConn *ssl;
-    int fd = backend_connect_blocking(g_config.server_ip, g_config.server_port, NULL, 0, 5000, &ssl);
+    int fd = backend_connect_blocking(g_config.server_ip, g_config.server_port, NULL, 0, 5000, NULL, &ssl);
     if (fd < 0) exit(1);
     if (net_write_all(fd, ssl, CLUSTER_NODES_CMD, strlen(CLUSTER_NODES_CMD)) < 0) {
         perror("write");

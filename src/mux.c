@@ -171,6 +171,19 @@ static int buf_reserve(char **buf, int *len, int *off, int *cap, int need) {
 
 void client_queue_reply(Worker *w, ClientConn *c, const char *data, int len);
 
+/* client-output-buffer-limit: a client that lets more than the limit of
+ * replies pile up (a slow pub/sub subscriber, typically) is disconnected
+ * instead of growing the proxy's memory without bound. */
+int client_check_obuf_limit(Worker *w, ClientConn *c) {
+    int limit = (c->in_subscribe || c->sub_conn) ? g_config.obuf_limit_pubsub : g_config.obuf_limit_normal;
+    if (limit <= 0 || c->close_asap || c->wbuf_len - c->wbuf_off <= limit) return 0;
+    fprintf(stderr, "[worker %d] closing %s: output buffer %d bytes over the %s limit\n", w->thread_id, c->addr,
+            c->wbuf_len - c->wbuf_off, (c->in_subscribe || c->sub_conn) ? "pubsub" : "normal");
+    c->close_asap = 1;
+    pw_add(w, c);
+    return -1;
+}
+
 static void client_out_append(Worker *w, ClientConn *c, const char *data, int len) {
     if (c->close_asap) return;
     if (c->wbuf_off == c->wbuf_len) c->wbuf_off = c->wbuf_len = 0;
@@ -182,6 +195,7 @@ static void client_out_append(Worker *w, ClientConn *c, const char *data, int le
     memcpy(c->wbuf + c->wbuf_len, data, (size_t)len);
     c->wbuf_len += len;
     pw_add(w, c);
+    client_check_obuf_limit(w, c);
 }
 
 /* A legacy command (legacy_dispatch()) hasn't finished: some of them wait
@@ -389,6 +403,10 @@ static void mux_destroy(Worker *w, MuxConn *m) {
  * gets an error reply, in order, and the mux is freed. */
 void mux_fail(Worker *w, MuxConn *m, const char *msg) {
     const ClusterNode *nd = &w->topo.nodes[m->node_idx];
+    /* A node that stopped answering may have failed over: a dead master
+     * never sends MOVED, so without this the proxy would only notice at the
+     * next periodic refresh (rate-limited, so storms are fine). */
+    topology_request_refresh();
     if (m->inflight > 0)
         fprintf(stderr, "[worker %d] backend %s:%d: %s (%d request(s) failed)\n", w->thread_id, nd->ip, nd->port, msg,
                 m->inflight);
@@ -495,7 +513,7 @@ static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
     m->gen = np->gen;
 #ifdef USE_TLS
     if (g_config.tls_backend) {
-        m->ssl = tls_new(fd, 0);
+        m->ssl = tls_new(fd, 0, nd->hostname[0] ? nd->hostname : nd->ip);
         if (!m->ssl) {
             close(fd);
             free(m);

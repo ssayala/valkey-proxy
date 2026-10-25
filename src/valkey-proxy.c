@@ -10,7 +10,10 @@
 /* All on-demand: ordinary traffic uses the shared muxes (mux.c), and pools
  * grow in the background when the legacy paths do need them (pool.c). */
 int g_pool_min[POOL_TYPE_COUNT] = {0, 0, 0, 0, 0};
-int g_pool_max[POOL_TYPE_COUNT] = {20, 10, 10, 10, 10};
+/* Blocking, subscription and ACL connections are each held by one client
+ * for as long as it blocks / stays subscribed / stays logged in, so their
+ * caps bound concurrent such clients per node per worker -- keep them high. */
+int g_pool_max[POOL_TYPE_COUNT] = {20, 1000, 1000, 10, 1000};
 
 Config g_config;
 ClusterNode g_nodes[MAX_NODES];
@@ -111,7 +114,14 @@ static void do_accept(Worker *w, int listen_fd) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) perror("accept");
             return;
         }
-        if (fd >= g_config.max_connection) {
+        int total = 0;
+        for (int i = 0; i < g_config.worker_thread_no && i < MAX_WORKERS; i++)
+            total += atomic_load_explicit(&g_workers[i].nclients, memory_order_relaxed);
+        if (fd >= g_config.max_connection || total >= g_config.maxclients) {
+            /* Tell the client why, as Valkey does, instead of a bare close. */
+            static const char FULL[] = "-ERR max number of clients reached\r\n";
+            ssize_t wr = write(fd, FULL, sizeof(FULL) - 1);
+            (void)wr;
             close(fd);
             continue;
         }
@@ -146,8 +156,8 @@ static void do_accept(Worker *w, int listen_fd) {
         /* TCP clients only (a local unix socket stays plaintext). The
          * handshake runs non-blocking from the event loop, driven by
          * handle_client_readable()/writable() via client_tls_continue(). */
-        if (g_config.tls_enabled && g_ssl_ctx && listen_fd != g_unix_fd) {
-            client->ssl = tls_new(fd, 1);
+        if (g_config.tls_enabled && listen_fd != g_unix_fd) { /* g_ssl_ctx: only under tls.c's lock */
+            client->ssl = tls_new(fd, 1, NULL);
             if (!client->ssl) {
                 close(fd);
                 free(client);
@@ -308,6 +318,7 @@ int main(int argc, char **argv) {
     sigemptyset(&stopsigs);
     sigaddset(&stopsigs, SIGTERM);
     sigaddset(&stopsigs, SIGINT);
+    sigaddset(&stopsigs, SIGHUP); /* reload TLS certificates */
     pthread_sigmask(SIG_BLOCK, &stopsigs, NULL);
 
     parse_conf(conf_path);
@@ -402,8 +413,26 @@ int main(int argc, char **argv) {
      * accepting, let every client finish what's in flight, close clients as
      * they go idle, and exit once none are left -- or after
      * shutdown-timeout seconds, or on a second signal. */
+    /* Until told to stop: SIGHUP reloads the TLS certificates, and with
+     * tls-auto-reload the files are checked every few seconds (Kubernetes
+     * secret rotation replaces them in place). */
     int sig;
-    sigwait(&stopsigs, &sig);
+    for (;;) {
+        struct timespec every = {5, 0};
+        sig = sigtimedwait(&stopsigs, NULL, &every);
+        if (sig == SIGTERM || sig == SIGINT) break;
+#ifdef USE_TLS
+        if (g_config.tls_enabled || g_config.tls_backend) {
+            if (sig == SIGHUP) {
+                printf("SIGHUP: reloading TLS certificates\n");
+                tls_reload();
+            } else if (g_config.tls_auto_reload && tls_files_changed()) {
+                printf("TLS certificate files changed: reloading\n");
+                tls_reload();
+            }
+        }
+#endif
+    }
     printf("Received %s: draining clients (up to %ds)...\n", sig == SIGTERM ? "SIGTERM" : "SIGINT",
            g_config.shutdown_timeout);
     atomic_store(&g_shutdown, 1);
@@ -423,7 +452,8 @@ int main(int argc, char **argv) {
             printf("Shutdown timeout: closing %d remaining client(s)\n", left);
             break;
         }
-        if (sigtimedwait(&stopsigs, NULL, &tick) > 0) {
+        int s2 = sigtimedwait(&stopsigs, NULL, &tick);
+        if (s2 == SIGTERM || s2 == SIGINT) {
             printf("Second signal: exiting now (%d client(s) still connected)\n", left);
             break;
         }

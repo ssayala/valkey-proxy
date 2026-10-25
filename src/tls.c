@@ -1,4 +1,5 @@
 #include "proxy.h"
+#include <sys/stat.h>
 
 /* ── TLS ────────────────────────────────────────────────────────────────
  * Every socket read/write in the proxy goes through net_read()/net_write(),
@@ -32,38 +33,131 @@ static void ctx_common(SSL_CTX *ctx) {
     SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
 }
 
-int init_tls(void) {
+/* The live contexts are swapped on reload (tls_reload()) while workers keep
+ * creating connections from them: SSL_new() and the swap both hold ctx_lock.
+ * SSL_new() takes a reference on its context, so existing connections keep
+ * the old one alive until they close; the proxy's own reference is dropped
+ * right after the swap. */
+static pthread_rwlock_t ctx_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static SSL_CTX *build_server_ctx(void) {
     if (!g_config.tls_cert[0] || !g_config.tls_key[0]) {
         fprintf(stderr, "TLS: tls-cert/tls-key not set\n");
-        return -1;
+        return NULL;
     }
-    g_ssl_ctx = SSL_CTX_new(TLS_server_method());
-    if (!g_ssl_ctx) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-    ctx_common(g_ssl_ctx);
-    if (SSL_CTX_use_certificate_chain_file(g_ssl_ctx, g_config.tls_cert) <= 0 ||
-        SSL_CTX_use_PrivateKey_file(g_ssl_ctx, g_config.tls_key, SSL_FILETYPE_PEM) <= 0) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-    if (!SSL_CTX_check_private_key(g_ssl_ctx)) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) goto err;
+    ctx_common(ctx);
+    if (SSL_CTX_use_certificate_chain_file(ctx, g_config.tls_cert) <= 0 ||
+        SSL_CTX_use_PrivateKey_file(ctx, g_config.tls_key, SSL_FILETYPE_PEM) <= 0)
+        goto err;
+    if (!SSL_CTX_check_private_key(ctx)) {
         fprintf(stderr, "TLS: cert/key mismatch\n");
-        return -1;
+        goto err;
     }
     if (g_config.tls_auth_clients) {
-        if (!g_config.tls_ca_cert[0] || SSL_CTX_load_verify_locations(g_ssl_ctx, g_config.tls_ca_cert, NULL) != 1) {
+        if (!g_config.tls_ca_cert[0] || SSL_CTX_load_verify_locations(ctx, g_config.tls_ca_cert, NULL) != 1) {
             fprintf(stderr, "TLS: tls-auth-clients needs a valid tls-ca-cert\n");
-            ERR_print_errors_fp(stderr);
-            return -1;
+            goto err;
         }
         int mode = SSL_VERIFY_PEER;
         if (g_config.tls_auth_clients == 1) mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
-        SSL_CTX_set_verify(g_ssl_ctx, mode, NULL);
+        SSL_CTX_set_verify(ctx, mode, NULL);
     }
-    SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_SERVER);
-    SSL_CTX_set_session_id_context(g_ssl_ctx, (const unsigned char *)"valkey-proxy", 12);
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
+    SSL_CTX_set_session_id_context(ctx, (const unsigned char *)"valkey-proxy", 12);
+    return ctx;
+err:
+    ERR_print_errors_fp(stderr);
+    SSL_CTX_free(ctx);
+    return NULL;
+}
+
+static SSL_CTX *build_backend_ctx(void) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) goto err;
+    ctx_common(ctx);
+    if (g_config.tls_backend_verify) {
+        int ok = g_config.tls_backend_ca_cert[0] ? SSL_CTX_load_verify_locations(ctx, g_config.tls_backend_ca_cert, NULL)
+                                                 : SSL_CTX_set_default_verify_paths(ctx);
+        if (ok != 1) {
+            fprintf(stderr, "TLS: can't load backend CA (tls-backend-ca-cert)\n");
+            goto err;
+        }
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    }
+    if (g_config.tls_backend_cert[0] &&
+        (SSL_CTX_use_certificate_chain_file(ctx, g_config.tls_backend_cert) <= 0 ||
+         SSL_CTX_use_PrivateKey_file(ctx, g_config.tls_backend_key, SSL_FILETYPE_PEM) <= 0))
+        goto err;
+    return ctx;
+err:
+    ERR_print_errors_fp(stderr);
+    SSL_CTX_free(ctx);
+    return NULL;
+}
+
+/* ── certificate reload ─────────────────────────────────────────────── */
+/* Identity of every file the contexts were built from, to notice when any
+ * changes (Kubernetes rewrites a mounted secret by swapping a symlink, so
+ * the inode and mtime of the path both change). */
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+    off_t size;
+    struct timespec mtime;
+} FileStamp;
+static FileStamp tls_stamps[7];
+
+static void tls_stamp_files(FileStamp *out) {
+    const char *files[7] = {g_config.tls_cert,        g_config.tls_key,          g_config.tls_ca_cert,
+                            g_config.tls_backend_ca_cert, g_config.tls_backend_cert, g_config.tls_backend_key,
+                            NULL};
+    for (int i = 0; i < 7; i++) {
+        struct stat st;
+        memset(&out[i], 0, sizeof(out[i]));
+        if (files[i] && files[i][0] && stat(files[i], &st) == 0) {
+            out[i].dev = st.st_dev;
+            out[i].ino = st.st_ino;
+            out[i].size = st.st_size;
+            out[i].mtime = st.st_mtim;
+        }
+    }
+}
+
+int tls_files_changed(void) {
+    if (!g_config.tls_enabled && !g_config.tls_backend) return 0;
+    FileStamp now[7];
+    tls_stamp_files(now);
+    return memcmp(now, tls_stamps, sizeof(now)) != 0;
+}
+
+/* Rebuilds the contexts from the configured files and swaps them in. On
+ * any failure the current ones stay in use. Called from main() only. */
+int tls_reload(void) {
+    SSL_CTX *srv = NULL, *be = NULL;
+    if (g_config.tls_enabled && !(srv = build_server_ctx())) goto fail;
+    if (g_config.tls_backend && !(be = build_backend_ctx())) goto fail;
+    pthread_rwlock_wrlock(&ctx_lock);
+    SSL_CTX *old_srv = g_ssl_ctx, *old_be = g_backend_ssl_ctx;
+    if (srv) g_ssl_ctx = srv;
+    if (be) g_backend_ssl_ctx = be;
+    pthread_rwlock_unlock(&ctx_lock);
+    if (srv) SSL_CTX_free(old_srv);
+    if (be) SSL_CTX_free(old_be);
+    tls_stamp_files(tls_stamps);
+    printf("TLS certificates reloaded\n");
+    return 0;
+fail:
+    SSL_CTX_free(srv);
+    tls_stamp_files(tls_stamps); /* don't retry the same broken files every check */
+    fprintf(stderr, "TLS reload failed: keeping the current certificates\n");
+    return -1;
+}
+
+int init_tls(void) {
+    if (!(g_ssl_ctx = build_server_ctx())) return -1;
+    tls_stamp_files(tls_stamps);
     printf("TLS (clients) enabled  cert=%s%s  ktls=%s\n", g_config.tls_cert,
            g_config.tls_auth_clients == 1   ? "  client-auth=required"
            : g_config.tls_auth_clients == 2 ? "  client-auth=optional"
@@ -73,45 +167,41 @@ int init_tls(void) {
 }
 
 int init_backend_tls(void) {
-    g_backend_ssl_ctx = SSL_CTX_new(TLS_client_method());
-    if (!g_backend_ssl_ctx) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-    ctx_common(g_backend_ssl_ctx);
-    if (g_config.tls_backend_verify) {
-        int ok = g_config.tls_backend_ca_cert[0]
-                     ? SSL_CTX_load_verify_locations(g_backend_ssl_ctx, g_config.tls_backend_ca_cert, NULL)
-                     : SSL_CTX_set_default_verify_paths(g_backend_ssl_ctx);
-        if (ok != 1) {
-            fprintf(stderr, "TLS: can't load backend CA (tls-backend-ca-cert)\n");
-            ERR_print_errors_fp(stderr);
-            return -1;
-        }
-        SSL_CTX_set_verify(g_backend_ssl_ctx, SSL_VERIFY_PEER, NULL);
-    }
-    if (g_config.tls_backend_cert[0]) {
-        if (SSL_CTX_use_certificate_chain_file(g_backend_ssl_ctx, g_config.tls_backend_cert) <= 0 ||
-            SSL_CTX_use_PrivateKey_file(g_backend_ssl_ctx, g_config.tls_backend_key, SSL_FILETYPE_PEM) <= 0) {
-            ERR_print_errors_fp(stderr);
-            return -1;
-        }
-    }
-    printf("TLS (backends) enabled  verify=%s%s\n", g_config.tls_backend_verify ? "yes" : "no",
+    if (!(g_backend_ssl_ctx = build_backend_ctx())) return -1;
+    tls_stamp_files(tls_stamps);
+    printf("TLS (backends) enabled  verify=%s%s%s\n", g_config.tls_backend_verify ? "yes" : "no",
+           g_config.tls_backend_verify && g_config.tls_backend_verify_host ? "  verify-host=yes" : "",
            g_config.tls_backend_cert[0] ? "  client-cert=yes" : "");
     return 0;
 }
 
-TlsConn *tls_new(int fd, int server) {
+/* host (client side only, may be NULL): the name the node is known by --
+ * sent as SNI if it's a DNS name, and with tls-backend-verify-host checked
+ * against the certificate (as a DNS name or an IP address). */
+TlsConn *tls_new(int fd, int server, const char *host) {
+    pthread_rwlock_rdlock(&ctx_lock);
     SSL_CTX *ctx = server ? g_ssl_ctx : g_backend_ssl_ctx;
-    if (!ctx) return NULL;
-    SSL *ssl = SSL_new(ctx);
+    SSL *ssl = ctx ? SSL_new(ctx) : NULL;
+    pthread_rwlock_unlock(&ctx_lock);
     if (!ssl) return NULL;
     SSL_set_fd(ssl, fd);
-    if (server)
+    if (server) {
         SSL_set_accept_state(ssl);
-    else
-        SSL_set_connect_state(ssl);
+        return ssl;
+    }
+    SSL_set_connect_state(ssl);
+    if (host && host[0]) {
+        unsigned char tmp[16];
+        int is_ip = inet_pton(AF_INET, host, tmp) == 1 || inet_pton(AF_INET6, host, tmp) == 1;
+        if (!is_ip) SSL_set_tlsext_host_name(ssl, host);
+        if (g_config.tls_backend_verify && g_config.tls_backend_verify_host) {
+            int ok = is_ip ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host) : SSL_set1_host(ssl, host);
+            if (ok != 1) {
+                SSL_free(ssl);
+                return NULL;
+            }
+        }
+    }
     return ssl;
 }
 
@@ -187,8 +277,8 @@ const char *tls_describe(TlsConn *ssl, char *buf, int cap) {
 
 /* Blocking handshake on a still-blocking fd (startup discovery, the legacy
  * pool's connects); timeout_ms bounds each wait. */
-TlsConn *tls_connect_blocking(int fd, int timeout_ms) {
-    TlsConn *ssl = tls_new(fd, 0);
+TlsConn *tls_connect_blocking(int fd, int timeout_ms, const char *host) {
+    TlsConn *ssl = tls_new(fd, 0, host);
     if (!ssl) return NULL;
     struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));

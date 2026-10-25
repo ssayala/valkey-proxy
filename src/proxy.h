@@ -32,7 +32,7 @@ typedef void TlsConn;
 /* Fallback for the "max_connection" proxy.conf setting (g_config.max_connection)
  * when the config file doesn't set it. This is the shared fd budget for the
  * whole process: client sockets + backend pool connections + listener(s). */
-#define DEFAULT_MAX_CONNECTIONS 4000
+#define DEFAULT_MAX_CONNECTIONS 16384
 #define CLUSTER_SLOTS           16384
 #define MAX_RESP_SIZE           (64 * 1024 * 1024)
 
@@ -146,12 +146,19 @@ typedef struct {
      * in-flight request down immediately: the connection is reconnected (or
      * destroyed on failure) only once the caller is done with it. */
     int discard_on_release;
+    int slot;            /* index in pool->conns[] */
+    void *next_free;     /* on pool->free_list once destroyed */
 } PoolConn;
 
 struct ConnPool {
     PoolType type;
-    PoolConn *conns;
-    int count, max;
+    /* Each connection is allocated separately and never moves, so pointers
+     * to it (backend_map, pending_conn, sub_conn, acl_conns, ...) stay valid
+     * while the pool grows and shrinks. Destroyed ones go to free_list
+     * (reset, not freed), as stale pointers to them may still be compared. */
+    PoolConn **conns;
+    int count, max, cap;
+    PoolConn *free_list;
     int node_idx, db;
     EventLoop *el;
     pthread_mutex_t lock;
@@ -451,9 +458,15 @@ typedef struct {
     int tls_backend;      /* connect to cluster nodes over TLS */
     char tls_backend_ca_cert[256], tls_backend_cert[256], tls_backend_key[256];
     int tls_backend_verify;
+    int tls_backend_verify_host; /* also check the node's name/IP against its certificate */
+    int tls_auto_reload;         /* reload certificates when their files change */
     int tls_ktls; /* let OpenSSL offload records to kernel TLS when possible */
     int max_multikey_payload;
     int max_connection;
+    int maxclients; /* client connections across all workers (as Valkey's maxclients) */
+    /* Close a client whose unsent replies exceed these (0 = no limit), like
+     * Valkey's client-output-buffer-limit hard limits. */
+    int obuf_limit_pubsub, obuf_limit_normal;
     int cluster_refresh_interval_ms; /* 0 = periodic refresh disabled */
     int cluster_node_fail_grace_ms;
     /* Connect timeout for backend connections made *after* startup: pool
@@ -570,12 +583,14 @@ int create_unix_listener(const char *path);
 #ifdef USE_TLS
 int init_tls(void);
 int init_backend_tls(void);
-TlsConn *tls_new(int fd, int server);
+TlsConn *tls_new(int fd, int server, const char *host);
+int tls_reload(void);        /* SIGHUP / changed files: rebuild contexts, keep old ones on failure */
+int tls_files_changed(void); /* any configured cert/key/CA file replaced since the last (re)load */
 void tls_free(TlsConn *ssl);
 int tls_handshake(TlsConn *ssl, int *want); /* 1 done, 0 in progress, -1 failed */
 int tls_ktls_state(TlsConn *ssl);           /* bit 0 = tx offloaded, bit 1 = rx */
 const char *tls_describe(TlsConn *ssl, char *buf, int cap);
-TlsConn *tls_connect_blocking(int fd, int timeout_ms);
+TlsConn *tls_connect_blocking(int fd, int timeout_ms, const char *host);
 #endif
 /* read()/write() on fd, through TLS when ssl != NULL (see src/tls.c). */
 ssize_t net_read(int fd, TlsConn *ssl, void *buf, size_t n, int *want);
@@ -586,7 +601,7 @@ int net_short_read_drained(TlsConn *ssl);
  * tls-backend is on; *ssl_out gets the session (NULL for plain TCP). sa, if
  * given, is ip:port already resolved (no DNS lookup then). */
 int backend_connect_blocking(const char *ip, int port, const struct sockaddr_storage *sa, socklen_t salen,
-                             int timeout_ms, TlsConn **ssl_out);
+                             int timeout_ms, const char *tls_host, TlsConn **ssl_out);
 
 /* ── cluster ────────────────────────────────────────────────────────── */
 void fetch_cluster_nodes(void);
@@ -694,6 +709,8 @@ void client_send_crossslot(Worker *w, ClientConn *client);
 void client_send_wrong_arity(Worker *w, ClientConn *client, const char *cmd);
 /* Queue a reply (in order, after anything already queued) for the client. */
 void client_queue_reply(Worker *w, ClientConn *client, const char *data, int len);
+/* Disconnects (deferred) a client over its client-output-buffer-limit; -1 if so. */
+int client_check_obuf_limit(Worker *w, ClientConn *client);
 void close_client(Worker *w, ClientConn *client);
 void resume_client_after_conn(Worker *w, ClientConn *client, PoolConn *conn);
 void client_recover_after_backend_error(Worker *w, ClientConn *client, PoolConn *conn, const char *msg);
