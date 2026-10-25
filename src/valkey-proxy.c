@@ -277,13 +277,15 @@ static void *worker_thread(void *arg) {
         return NULL;
     }
 #endif
+    w->last_sweep = time(NULL);
     while (1) {
-        int n = el_poll(w->el, worker_has_ready_backlog(w) ? 0 : -1);
+        int n = el_poll(w->el, worker_has_ready_backlog(w) ? 0 : worker_sweep_interval_ms());
         if (n < 0) break;
         w->now = time(NULL);
         if (w->topology_version_seen != topology_version_load()) worker_sync_topology(w);
         worker_dispatch_events(w, n);
         worker_after_events(w);
+        worker_sweep_clients(w);
     }
     return NULL;
 }

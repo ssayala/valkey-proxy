@@ -127,6 +127,38 @@ void run_pipeline_tests(const char *host, int port, int *pass, int *fail) {
     proxy_cmd(fd, r, sizeof(r), 2, "GET", "tc:pl:7");
     CHECK(!strcmp(r, "v7"), "proxy unaffected by clients closing mid-pipeline", pass, fail);
 
+    /* ── cross-slot fan-out and local PING/ECHO, pipelined ─────────────── */
+    b.len = 0;
+    pb_cmd(&b, 7, "MSET", "tc:pl:fa", "1", "tc:pl:fb", "2", "tc:pl:fc", "3");
+    pb_cmd(&b, 2, "PING", "hi");
+    pb_cmd(&b, 5, "MGET", "tc:pl:fa", "tc:pl:fb", "tc:pl:nokey", "tc:pl:fc");
+    pb_cmd(&b, 2, "ECHO", "e");
+    pb_cmd(&b, 5, "EXISTS", "tc:pl:fa", "tc:pl:nokey", "tc:pl:fb", "tc:pl:fc");
+    pb_cmd(&b, 4, "DEL", "tc:pl:fa", "tc:pl:fb", "tc:pl:fc");
+    pb_cmd(&b, 1, "PING");
+    write_all(fd, b.buf, b.len, b.len);
+    resp_next_str(fd, r, sizeof(r));
+    CHECK(!strcmp(r, "+OK"), "pipelined cross-slot MSET", pass, fail);
+    resp_next_str(fd, r, sizeof(r));
+    CHECK(!strcmp(r, "hi"), "PING <msg> answered in order", pass, fail);
+    {
+        const char *want[] = {"*4", "1", "2", "(nil)", "3"};
+        int ok = 1;
+        for (int i = 0; i < 5; i++) {
+            resp_next_str(fd, r, sizeof(r));
+            if (strcmp(r, want[i]) != 0) ok = 0;
+        }
+        CHECK(ok, "pipelined cross-slot MGET: values in key order, nil for missing", pass, fail);
+    }
+    resp_next_str(fd, r, sizeof(r));
+    CHECK(!strcmp(r, "e"), "ECHO answered in order", pass, fail);
+    resp_next_str(fd, r, sizeof(r));
+    CHECK(!strcmp(r, ":3"), "pipelined cross-slot EXISTS sums per-node counts", pass, fail);
+    resp_next_str(fd, r, sizeof(r));
+    CHECK(!strcmp(r, ":3"), "pipelined cross-slot DEL sums per-node counts", pass, fail);
+    resp_next_str(fd, r, sizeof(r));
+    CHECK(!strcmp(r, "+PONG"), "PING after fan-out", pass, fail);
+
     /* ── protocol error queued behind an in-flight reply ───────────────── */
     b.len = 0;
     pb_cmd(&b, 2, "GET", "tc:pl:7");

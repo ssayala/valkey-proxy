@@ -184,6 +184,7 @@ static void client_send_done(Worker *w, ClientConn *c, int res) {
         return;
     }
     op->off += res;
+    c->last_interaction = w->now; /* replies count as activity, as in Valkey */
     if (op->off < op->len) {
         uop_resend(w, c->fd, op);
         return;
@@ -310,8 +311,19 @@ fail:
 void uring_worker_loop(Worker *w) {
     struct io_uring *r = ring_of(w);
     arm_epoll(w);
+    w->last_sweep = time(NULL);
+    int sweep_ms = worker_sweep_interval_ms();
     for (;;) {
-        int rc = worker_has_ready_backlog(w) ? io_uring_submit_and_get_events(r) : io_uring_submit_and_wait(r, 1);
+        int rc;
+        if (worker_has_ready_backlog(w)) {
+            rc = io_uring_submit_and_get_events(r);
+        } else if (sweep_ms > 0) {
+            struct io_uring_cqe *unused;
+            struct __kernel_timespec ts = {sweep_ms / 1000, (long long)(sweep_ms % 1000) * 1000000};
+            rc = io_uring_submit_and_wait_timeout(r, &unused, 1, &ts, NULL);
+        } else {
+            rc = io_uring_submit_and_wait(r, 1);
+        }
         if (rc < 0 && rc != -EINTR && rc != -EAGAIN && rc != -EBUSY && rc != -ETIME) {
             fprintf(stderr, "[worker %d] io_uring_enter: %s\n", w->thread_id, strerror(-rc));
             break;
@@ -348,6 +360,7 @@ void uring_worker_loop(Worker *w) {
             }
         }
         worker_after_events(w);
+        worker_sweep_clients(w);
     }
 }
 #endif

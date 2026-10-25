@@ -524,6 +524,9 @@ static void cmd_info_add(const char *name) {
      * XINFO, MEMORY) take their key from arg[2] or special-case HELP -- see
      * legacy_dispatch() in client.c. */
     ci->fast = ci->pool == POOL_NORMAL && ci->cls == CMD_CLASS_SINGLE_KEY && !ci->container;
+    static const char *FAN[] = {"MGET", "MSET", "DEL", "EXISTS", "TOUCH", "UNLINK", NULL};
+    ci->fanout = cmd_in_list(name, FAN);
+    ci->local = !strcmp(name, "PING") || !strcmp(name, "ECHO");
 }
 
 void cmd_info_init(void) {

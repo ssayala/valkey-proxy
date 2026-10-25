@@ -178,6 +178,8 @@ struct ConnPool {
 struct Req {
     ClientConn *client; /* NULL = internal (SELECT/HELLO) or client already closed */
     FanoutSub *sub;     /* fan-out sub-request: reply goes to sub->rbuf instead */
+    struct FastFan *fan; /* pipelined fan-out sub-request (see fan_*() in mux.c) */
+    int fan_idx;
     Req *cnext;         /* next in client's reply-order queue */
     Req *mnext;         /* next in mux in-flight FIFO (or worker freelist) */
     int done;           /* reply arrived (held in reply[]) before earlier ones */
@@ -421,10 +423,16 @@ typedef struct {
     ClientConn *pw_head; /* clients with unsent output */
     ClientConn *bl_head; /* clients with buffered, unprocessed input */
     unsigned close_seq;  /* bumped by close_client() */
+    /* Slot -> sub-request index scratch for pipelined fan-out, valid where
+     * fan_slot_gen[slot] == fan_gen (avoids clearing 16K entries per call). */
+    int *fan_slot_sub;
+    unsigned *fan_slot_gen;
+    unsigned fan_gen;
     /* io_uring (USE_IOURING builds, "io-uring yes"): NULL = epoll only. */
     void *ring;
     uint8_t *uring_fd; /* fds whose I/O goes through the ring, not epoll */
     time_t now;
+    time_t last_sweep;
 } Worker;
 
 typedef struct {
@@ -456,6 +464,8 @@ typedef struct {
     int backend_connect_timeout_ms;
     int verbose; /* "verbose yes": per-command/per-connection logging */
     int max_command_size; /* largest single client command accepted */
+    int client_timeout;        /* "timeout": close clients idle this many seconds (0 = never) */
+    int tls_handshake_timeout; /* seconds a client gets to finish its TLS handshake */
     int worker_cpu_affinity; /* pin worker i to CPU (cpu_affinity_base + i) */
     int io_uring;            /* use io_uring for plain-TCP client/backend I/O (USE_IOURING builds) */
     int cpu_affinity_base;
@@ -625,7 +635,9 @@ typedef struct {
     PoolType pool;
     CmdClass cls;
     int container;
-    int fast; /* eligible for the pipelined single-key fast path */
+    int fast;   /* eligible for the pipelined single-key fast path */
+    int fanout; /* pipelined cross-slot fan-out (MGET/MSET/DEL/EXISTS/TOUCH/UNLINK) */
+    int local;  /* answered by the proxy itself (PING/ECHO) */
 } CmdInfo;
 void cmd_info_init(void);
 const CmdInfo *cmd_info(const char *cmd); /* NULL = unsupported */
@@ -710,6 +722,10 @@ int mux_on_recv(Worker *w, MuxConn *m, int n);
  * order, and m is freed. */
 void mux_fail(Worker *w, MuxConn *m, const char *msg);
 int worker_has_ready_backlog(Worker *w);
+/* Closes idle / handshake-stalled clients; call once per second or so.
+ * worker_sweep_interval_ms() is how long the loop may sleep (-1 = forever). */
+void worker_sweep_clients(Worker *w);
+int worker_sweep_interval_ms(void);
 
 /* ── backend / client event handlers ───────────────────────────────── */
 void handle_backend_writable(Worker *w, PoolConn *conn);

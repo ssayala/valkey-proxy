@@ -86,6 +86,14 @@ tls-enabled  no
 # most of the remaining cost is the kernel TCP stack itself.
 # io-uring  yes
 
+# Close clients idle for more than N seconds (default: 0 = never). As in
+# Valkey, blocked (BLPOP...) and subscribed clients are exempt, and both
+# commands and replies count as activity.
+# timeout  300
+
+# Seconds a TLS client gets to complete its handshake (default: 10)
+# tls-handshake-timeout  10
+
 # Per-command / per-connection trace logging (default: no)
 # verbose  yes
 

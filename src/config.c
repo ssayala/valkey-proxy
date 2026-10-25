@@ -18,6 +18,7 @@ void parse_conf(const char *path) {
     g_config.cluster_node_fail_grace_ms = 10000;
     g_config.backend_connect_timeout_ms = 1000;
     g_config.max_command_size = 512 * 1024 * 1024;
+    g_config.tls_handshake_timeout = 10;
 #ifdef USE_IOURING
     g_config.io_uring = 1; /* built in on purpose: on unless "io-uring no" */
 #endif
@@ -69,6 +70,10 @@ void parse_conf(const char *path) {
             g_config.cluster_refresh_interval_ms = atoi(val);
         else if (!strcmp(key, "cluster_node_fail_grace_ms"))
             g_config.cluster_node_fail_grace_ms = atoi(val);
+        else if (!strcmp(key, "timeout"))
+            g_config.client_timeout = atoi(val);
+        else if (!strcmp(key, "tls-handshake-timeout"))
+            g_config.tls_handshake_timeout = atoi(val);
         else if (!strcmp(key, "io-uring"))
             g_config.io_uring = (!strcmp(val, "yes"));
         else if (!strcmp(key, "worker-cpu-affinity"))

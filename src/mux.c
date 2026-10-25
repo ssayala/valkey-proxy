@@ -221,6 +221,8 @@ static void sub_deliver(Worker *w, FanoutSub *sub, const char *data, int len, in
 /* Request r (already off any mux FIFO) has its reply. If it's next in its
  * client's order, write it straight to the client along with any later
  * replies that were held back waiting for it; otherwise park a copy. */
+static void fan_sub_done(Worker *w, struct FastFan *f, int idx, const char *data, int len, int failed);
+
 static void req_deliver_ex(Worker *w, Req *r, const char *data, int len, int failed) {
     if (r->client && r->inflight_kind) {
         if (r->inflight_kind == 2)
@@ -228,6 +230,13 @@ static void req_deliver_ex(Worker *w, Req *r, const char *data, int len, int fai
         else
             r->client->shared_inflight--;
         r->inflight_kind = 0;
+    }
+    if (r->fan) {
+        struct FastFan *f = r->fan;
+        int idx = r->fan_idx;
+        req_free(w, r);
+        fan_sub_done(w, f, idx, data, len, failed);
+        return;
     }
     if (r->sub) {
         FanoutSub *sub = r->sub;
@@ -619,7 +628,7 @@ static int mux_try_redirect(Worker *w, MuxConn *m, Req *r, const char *d, int le
         return 0;
     }
     if (!ask) topology_request_refresh();
-    if (!r->cmd || r->redirects >= MAX_REDIRECTS || (!r->client && !r->sub)) return 0;
+    if (!r->cmd || r->redirects >= MAX_REDIRECTS || (!r->client && !r->sub && !r->fan)) return 0;
 
     const char *end = d + len;
     int slot = 0;
@@ -1249,6 +1258,288 @@ send_multi_and_queue:
     return 1;
 }
 
+/* ── pipelined fan-out ──────────────────────────────────────────────────
+ * MGET / MSET / DEL / EXISTS / TOUCH / UNLINK without waiting in line like
+ * the legacy fan-out (fanout.c), which needs the client's earlier replies
+ * flushed and handles one command at a time. All keys in one slot (hash
+ * tags): forwarded as one ordinary fast-path request. Otherwise one sub-
+ * request per slot goes over the shared muxes, in the client's own RESP
+ * version, and a placeholder Req (creq) holds the client's reply position
+ * until every sub has answered. */
+enum { FAN_MGET, FAN_MSET, FAN_SUM };
+
+struct FastFan {
+    Req *creq;
+    int kind, nsubs, ndone, nkeys;
+    int dispatching; /* sub completions can't finish the fan while it's being built */
+    long long sum;
+    char *err;
+    int err_len;
+    int *key_sub, *key_pos; /* MGET: which sub, and which element of its reply */
+    char **rep;             /* MGET: each sub's reply */
+    int *rep_len;
+};
+
+static void fan_finish(Worker *w, struct FastFan *f) {
+    char small[32];
+    char *out = small;
+    int len = 0;
+    if (f->err) {
+        out = f->err;
+        len = f->err_len;
+    } else if (f->kind == FAN_SUM) {
+        len = snprintf(small, sizeof(small), ":%lld\r\n", f->sum);
+    } else if (f->kind == FAN_MSET) {
+        len = snprintf(small, sizeof(small), "+OK\r\n");
+    } else {
+        /* Element offsets within each sub reply, then splice in key order. */
+        int **elem = calloc((size_t)f->nsubs, sizeof(int *));
+        int total = 16, ok = elem != NULL;
+        for (int s = 0; ok && s < f->nsubs; s++) {
+            const char *b = f->rep[s];
+            int bl = f->rep_len[s];
+            const char *nl = (b && bl > 1 && b[0] == '*') ? memchr(b, '\n', (size_t)bl) : NULL;
+            int n = nl ? atoi(b + 1) : -1;
+            if (n < 0 || !(elem[s] = malloc(sizeof(int) * (size_t)(n + 1)))) {
+                ok = 0;
+                break;
+            }
+            int off = (int)(nl - b) + 1;
+            for (int i = 0; i < n; i++) {
+                int el = resp_response_len(b + off, bl - off);
+                if (el <= 0) {
+                    ok = 0;
+                    break;
+                }
+                elem[s][i] = off;
+                off += el;
+            }
+            elem[s][n] = off;
+            total += off;
+        }
+        if (ok && (out = malloc((size_t)total))) {
+            len = snprintf(out, 16, "*%d\r\n", f->nkeys);
+            for (int k = 0; k < f->nkeys; k++) {
+                int s = f->key_sub[k], i = f->key_pos[k];
+                int el = elem[s][i + 1] - elem[s][i];
+                memcpy(out + len, f->rep[s] + elem[s][i], (size_t)el);
+                len += el;
+            }
+        } else {
+            out = small;
+            len = snprintf(small, sizeof(small), "-ERR bad backend response\r\n");
+        }
+        for (int s = 0; elem && s < f->nsubs; s++) free(elem[s]);
+        free(elem);
+    }
+    req_deliver(w, f->creq, out, len);
+    if (out != small && out != f->err) free(out);
+    for (int s = 0; f->rep && s < f->nsubs; s++) free(f->rep[s]);
+    free(f->err);
+    free(f);
+}
+
+static void fan_sub_done(Worker *w, struct FastFan *f, int idx, const char *data, int len, int failed) {
+    if (failed || (len > 0 && data[0] == '-')) {
+        if (!f->err && (f->err = malloc((size_t)len))) {
+            memcpy(f->err, data, (size_t)len);
+            f->err_len = len;
+        }
+    } else if (f->kind == FAN_SUM) {
+        if (len > 1 && data[0] == ':') f->sum += strtoll(data + 1, NULL, 10);
+    } else if (f->kind == FAN_MGET) {
+        if ((f->rep[idx] = malloc((size_t)len))) {
+            memcpy(f->rep[idx], data, (size_t)len);
+            f->rep_len[idx] = len;
+        }
+    }
+    if (++f->ndone == f->nsubs && !f->dispatching) fan_finish(w, f);
+}
+
+/* Starts a fan-out command (or answers it with an error, in order). */
+static void fan_dispatch(Worker *w, ClientConn *c, const char *cmd, const char *p, int total, int argc) {
+    int kind = !strcmp(cmd, "MGET") ? FAN_MGET : !strcmp(cmd, "MSET") ? FAN_MSET : FAN_SUM;
+    int stride = kind == FAN_MSET ? 2 : 1;
+    if (argc < 1 + stride || (argc - 1) % stride) {
+        char e[96], lc[24];
+        int n = 0;
+        for (; cmd[n] && n < 23; n++) lc[n] = (char)tolower((unsigned char)cmd[n]);
+        lc[n] = '\0';
+        snprintf(e, sizeof(e), "-ERR wrong number of arguments for '%s' command\r\n", lc);
+        client_reply_ordered(w, c, e, (int)strlen(e));
+        return;
+    }
+    int nargs = argc - 1, nkeys = nargs / stride;
+    const char **ap = malloc(sizeof(char *) * (size_t)nargs);
+    int *al = malloc(sizeof(int) * (size_t)nargs), *slot = malloc(sizeof(int) * (size_t)nkeys);
+    if (!ap || !al || !slot) goto oom;
+    /* Walk the (already validated) multibulk: skip "*N" and the command. */
+    const char *q = memchr(p, '\n', (size_t)total) + 1;
+    for (int i = -1; i < nargs; i++) {
+        int l = atoi(q + 1);
+        q = memchr(q, '\n', (size_t)(p + total - q)) + 1;
+        if (i >= 0) {
+            ap[i] = q;
+            al[i] = l;
+        }
+        q += l + 2;
+    }
+    int one_slot = 1;
+    for (int k = 0; k < nkeys; k++) {
+        slot[k] = key_slot(ap[k * stride], al[k * stride]);
+        int ni = w->topo.slot_map[slot[k]];
+        if (ni < 0 || ni >= w->topo.node_count) {
+            client_reply_error(w, c, "slot not mapped");
+            goto done;
+        }
+        if (slot[k] != slot[0]) one_slot = 0;
+    }
+
+    if (one_slot) { /* the whole command can go to one node as-is */
+        MuxConn *m = mux_for(w, c, w->topo.slot_map[slot[0]]);
+        Req *r = m ? client_req_new(w, c) : NULL;
+        if (!m) client_reply_error(w, c, "backend connection error");
+        if (r) {
+            req_keep_cmd(r, p, total);
+            r->inflight_kind = 1;
+            c->shared_inflight++;
+            mux_enqueue(w, m, r, p, total);
+        }
+        goto done;
+    }
+
+    if (!w->fan_slot_sub) {
+        w->fan_slot_sub = malloc(sizeof(int) * CLUSTER_SLOTS);
+        w->fan_slot_gen = calloc(CLUSTER_SLOTS, sizeof(unsigned));
+        if (!w->fan_slot_sub || !w->fan_slot_gen) goto oom;
+    }
+    if (++w->fan_gen == 0) { /* wrapped: stale stamps could look current */
+        memset(w->fan_slot_gen, 0, sizeof(unsigned) * CLUSTER_SLOTS);
+        w->fan_gen = 1;
+    }
+    int nsubs = 0;
+    for (int k = 0; k < nkeys; k++) {
+        int s = slot[k];
+        if (w->fan_slot_gen[s] != w->fan_gen) {
+            w->fan_slot_gen[s] = w->fan_gen;
+            w->fan_slot_sub[s] = nsubs++;
+        }
+    }
+    struct FastFan *f = calloc(1, sizeof(*f) + sizeof(int) * 2 * (size_t)nkeys + (sizeof(char *) + sizeof(int)) * (size_t)nsubs);
+    if (!f) goto oom;
+    f->kind = kind;
+    f->nkeys = nkeys;
+    f->nsubs = nsubs;
+    f->key_sub = (int *)(f + 1);
+    f->key_pos = f->key_sub + nkeys;
+    f->rep = (char **)(f->key_pos + nkeys);
+    f->rep_len = (int *)(f->rep + nsubs);
+    if (!(f->creq = client_req_new(w, c))) {
+        free(f);
+        goto done;
+    }
+    f->creq->inflight_kind = 1;
+    c->shared_inflight++;
+
+    int *cnt = calloc((size_t)nsubs, sizeof(int));
+    int *sub_node = malloc(sizeof(int) * (size_t)nsubs);
+    if (!cnt || !sub_node) {
+        free(cnt);
+        free(sub_node);
+        static const char OOM[] = "-ERR out of memory\r\n";
+        if ((f->err = malloc(sizeof(OOM) - 1))) {
+            memcpy(f->err, OOM, sizeof(OOM) - 1);
+            f->err_len = (int)sizeof(OOM) - 1;
+        }
+        fan_finish(w, f); /* nothing was sent: answer the placeholder now */
+        goto done;
+    }
+    for (int k = 0; k < nkeys; k++) {
+        int s = w->fan_slot_sub[slot[k]];
+        f->key_sub[k] = s;
+        f->key_pos[k] = cnt[s]++;
+        sub_node[s] = w->topo.slot_map[slot[k]];
+    }
+
+    f->dispatching = 1;
+    int cl = (int)strlen(cmd);
+    for (int s = 0; s < nsubs; s++) {
+        /* "*<1+n>\r\n$<cl>\r\n<CMD>\r\n" + this slot's args */
+        int need = 48 + cl;
+        for (int k = 0; k < nkeys; k++)
+            if (f->key_sub[k] == s)
+                for (int j = 0; j < stride; j++) need += al[k * stride + j] + 16;
+        char *buf = malloc((size_t)need);
+        MuxConn *m = buf ? mux_for(w, c, sub_node[s]) : NULL;
+        Req *r = m ? req_new(w) : NULL;
+        if (!r) {
+            free(buf);
+            fan_sub_done(w, f, s, "-ERR backend connection error\r\n", 31, 1);
+            continue;
+        }
+        int o = snprintf(buf, (size_t)need, "*%d\r\n$%d\r\n%s\r\n", 1 + cnt[s] * stride, cl, cmd);
+        for (int k = 0; k < nkeys; k++) {
+            if (f->key_sub[k] != s) continue;
+            for (int j = 0; j < stride; j++) {
+                int a = k * stride + j;
+                o += snprintf(buf + o, (size_t)(need - o), "$%d\r\n", al[a]);
+                memcpy(buf + o, ap[a], (size_t)al[a]);
+                o += al[a];
+                buf[o++] = '\r';
+                buf[o++] = '\n';
+            }
+        }
+        r->fan = f;
+        r->fan_idx = s;
+        req_keep_cmd(r, buf, o);
+        mux_enqueue(w, m, r, buf, o);
+        free(buf);
+    }
+    f->dispatching = 0;
+    if (f->ndone == f->nsubs) fan_finish(w, f);
+    free(cnt);
+    free(sub_node);
+    goto done;
+oom:
+    c->close_asap = 1;
+    pw_add(w, c);
+done:
+    free(ap);
+    free(al);
+    free(slot);
+}
+
+/* PING / ECHO: answered locally, in order. */
+static void local_reply(Worker *w, ClientConn *c, const char *cmd, const char *p, int total, int argc) {
+    const char *a = NULL;
+    int alen = 0;
+    if (argc == 2 && !resp_get_nth_arg(p, total, 1, &a, &alen)) argc = -1;
+    int is_ping = !strcmp(cmd, "PING");
+    if (is_ping ? argc > 2 || argc < 1 : argc != 2) {
+        char e[80];
+        snprintf(e, sizeof(e), "-ERR wrong number of arguments for '%s' command\r\n", is_ping ? "ping" : "echo");
+        client_reply_str(w, c, e);
+        return;
+    }
+    if (argc == 1) {
+        client_reply_str(w, c, "+PONG\r\n");
+        return;
+    }
+    char hdr[24];
+    int hl = snprintf(hdr, sizeof(hdr), "$%d\r\n", alen);
+    char *out = malloc((size_t)(hl + alen + 2));
+    if (!out) {
+        c->close_asap = 1;
+        pw_add(w, c);
+        return;
+    }
+    memcpy(out, hdr, (size_t)hl);
+    memcpy(out + hl, a, (size_t)alen);
+    memcpy(out + hl + alen, "\r\n", 2);
+    client_reply_ordered(w, c, out, hl + alen + 2);
+    free(out);
+}
+
 /* Parses and dispatches as many complete commands from c->ibuf as can be
  * started right now. Stops at an incomplete command, at a legacy command
  * that has to wait for earlier fast-path replies, while a legacy command is
@@ -1330,6 +1621,20 @@ void client_process_input(Worker *w, ClientConn *c) {
                 c->ibuf_off += (int)consume;
                 continue;
             }
+        }
+
+        if (ci && (ci->fanout || ci->local) && !c->in_subscribe && !c->acl_authenticated && !c->sub_conn) {
+            if (c->rq_count >= CLIENT_MAX_INFLIGHT || client_out_bytes(c) >= CLIENT_MAX_PENDING_OUT ||
+                (ci->fanout && c->pin_inflight > 0))
+                break;
+            c->last_interaction = w->now;
+            record_last_cmd(c, cmd, kp, kl);
+            if (ci->local)
+                local_reply(w, c, cmd, p, (int)total, argc);
+            else
+                fan_dispatch(w, c, cmd, p, (int)total, argc);
+            c->ibuf_off += (int)consume;
+            continue;
         }
 
         if (ci && ci->fast && kl > 0 && !c->in_subscribe && !c->acl_authenticated && !c->sub_conn) {
@@ -1434,6 +1739,7 @@ void client_tls_continue(Worker *w, ClientConn *c) {
 int client_on_recv(Worker *w, ClientConn *c, int n) {
     int fd = c->fd;
     c->ibuf_len += n;
+    c->last_interaction = w->now;
     client_process_input(w, c);
     if (fd >= g_config.max_connection || w->client_map[fd] != c) return -1;
     int unparsed = c->ibuf_len - c->ibuf_off;
@@ -1519,6 +1825,7 @@ void handle_client_readable(Worker *w, ClientConn *c) {
             return;
         }
         c->ibuf_len += (int)n;
+        c->last_interaction = w->now;
         if (n < space && net_short_read_drained(c->ssl)) break;
     }
     c->read_paused = 0;
@@ -1570,6 +1877,7 @@ int client_flush(Worker *w, ClientConn *c) {
             return -1;
         }
         c->wbuf_off += (int)n;
+        c->last_interaction = w->now; /* replies count as activity, as in Valkey */
     }
     c->wbuf_off = c->wbuf_len = 0;
     if ((w->fd_mask[c->fd] & EL_WRITABLE) && !c->ssl_read_wants_write) fd_unwatch(w, c->fd, EL_WRITABLE);
@@ -1613,6 +1921,37 @@ void worker_after_events(Worker *w) {
     while ((c = w->pw_head)) {
         pw_remove(w, c);
         client_flush(w, c);
+    }
+}
+
+/* ── timeouts ─────────────────────────────────────────────────────────── */
+int worker_sweep_interval_ms(void) {
+    return (g_config.client_timeout > 0 || (g_config.tls_enabled && g_config.tls_handshake_timeout > 0)) ? 1000 : -1;
+}
+
+/* Like Valkey's "timeout": idle clients are closed, except ones that are
+ * legitimately waiting -- blocked in a legacy command (BLPOP etc.), with
+ * replies still in flight, or subscribed. Clients that never finished their
+ * TLS handshake get tls-handshake-timeout seconds. */
+void worker_sweep_clients(Worker *w) {
+    if (w->now == w->last_sweep) return;
+    w->last_sweep = w->now;
+    int idle = g_config.client_timeout, hs = g_config.tls_handshake_timeout;
+    for (int fd = 0; fd < g_config.max_connection; fd++) {
+        ClientConn *c = w->client_map[fd];
+        if (!c) continue;
+        if (c->tls_hs) {
+            if (hs > 0 && w->now - c->connect_time >= hs) {
+                LOG_VERBOSE("[worker %d] closing %s: TLS handshake timeout\n", w->thread_id, c->addr);
+                close_client(w, c);
+            }
+            continue;
+        }
+        if (idle <= 0 || w->now - c->last_interaction <= idle) continue; /* Valkey: idle > timeout */
+        if (c->state != CS_READING_HDR || c->rq_head || c->in_subscribe || c->sub_conn || client_out_bytes(c) > 0)
+            continue;
+        LOG_VERBOSE("[worker %d] closing %s: idle for %lds\n", w->thread_id, c->addr, (long)(w->now - c->last_interaction));
+        close_client(w, c);
     }
 }
 

@@ -9,7 +9,7 @@
 | **Multi-key fan-out** | Split the command per key into several sub-commands sent to their respective nodes, then merge the replies |
 | **No-key broadcast** | Broadcast to every primary node and merge the replies |
 | **Single-node forward** | Pick one master node, forward the command, and relay its reply verbatim (no broadcast, no merging) |
-| **Local reply** | The proxy builds the reply itself, with no backend request at all |
+| **Local reply** | The proxy builds the reply itself, with no backend request at all (e.g. `PING`, `ECHO` outside of subscribe mode) |
 
 ## 2. Fan-out command details
 
@@ -29,6 +29,13 @@ merged into one reply (`FANOUT_CMDS` in `src/fanout.c`):
 
 Fan-out commands accept any number of keys (bounded only by `max_command_size`); sub-commands
 travel over the same shared pipelined connections as single-key commands.
+
+`MGET`, `MSET`, `DEL`, `EXISTS`, `TOUCH` and `UNLINK` are pipelined like single-key commands
+(no waiting for the client's earlier replies): when all keys share a slot the command is forwarded
+as-is to that node; otherwise one sub-command per slot is sent and the replies are merged in key
+order. If any sub-command fails, the whole command returns that error (it is not turned into nil
+values). The other fan-out commands (`JSON.MGET`, `JSON.MSET`, `MSETEX`, `LCS`) use the
+one-at-a-time path.
 
 ## 2a. Transactions (`MULTI` / `EXEC` / `DISCARD` / `WATCH` / `UNWATCH`)
 
