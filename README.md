@@ -49,8 +49,8 @@ cpu-affinity-base    0
 db                0    # default database (default: 0)
 
 # Connection pool sizes
-min_normal_connection        2
-min_blocking_connection      2
+min_normal_connection        0
+min_blocking_connection      0
 min_subscription_connection  0
 min_transaction_connection   0
 min_acl_connection           0
@@ -96,6 +96,9 @@ tls-enabled  no
 
 # Seconds a TLS client gets to complete its handshake (default: 10)
 # tls-handshake-timeout  10
+
+# TCP keepalive on client and backend sockets, seconds (default: 300; 0 = off)
+# tcp-keepalive  300
 
 # Per-command / per-connection trace logging (default: no)
 # verbose  yes

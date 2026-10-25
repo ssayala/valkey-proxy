@@ -59,8 +59,6 @@ unix-socket /var/run/valkey/proxy.sock
 unix-socket-perm 660              # app container must share the group (fsGroup)
 worker-thread-no 1
 cluster_refresh_interval_ms 5000  # Valkey pods come back on new IPs
-min_normal_connection   0         # warm lazily: N pods x nodes adds up
-min_blocking_connection 0
 shutdown-timeout 10               # keep below terminationGracePeriodSeconds
 # tls-backend yes
 # tls-backend-ca-cert /etc/valkey-tls/ca.crt
@@ -90,9 +88,8 @@ shutdown-timeout 10               # keep below terminationGracePeriodSeconds
   liveness.
 - **Backend connection count.** Each proxy opens roughly one or two shared
   connections per Valkey node per worker, plus pool connections for blocking,
-  pub/sub and ACL traffic as needed. With the `min_*_connection 0` settings
-  above, 100 pods against a cluster mean on the order of 100-200 connections
-  per Valkey node.
+  pub/sub and ACL traffic as needed (pools start empty). 100 pods against a
+  cluster mean on the order of 100-200 connections per Valkey node.
 - **Sizing.** Without client pipelining the proxy uses roughly 4-9 µs of CPU
   per request (similar to what a Valkey node spends), with pipelining well
   under 1 µs. One worker thread covers most sidecars.

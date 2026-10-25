@@ -435,6 +435,8 @@ static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
     set_nonblocking(fd);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    set_tcp_keepalive(fd);
+    fd_reset(w, fd);
     int rc = connect(fd, (const struct sockaddr *)&nd->sa, nd->salen);
     if (rc < 0 && errno != EINPROGRESS) {
         close(fd);

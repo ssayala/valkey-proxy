@@ -2341,7 +2341,7 @@ static int format_client_info_line(Worker *w, ClientConn *client, char *out, int
     return snprintf(out, (size_t)cap,
                     "id=%lld addr=%s laddr=%s fd=%d name=%s age=%lld idle=%lld flags=N db=%d "
                     "sub=%d psub=%d ssub=%d multi=%d watch=%d events=%s cmd=%s user=%s resp=%d",
-                    client->id, client->addr, client->laddr, client->fd, client->name,
+                    client->id, client->addr, client_laddr(client), client->fd, client->name,
                     (long long)(now - client->connect_time), (long long)(now - client->last_interaction), client->db,
                     client->sub_count, client->psub_count, client->ssub_count, client->multi_count, client->watch_count,
                     events, client->last_cmd, user, client->resp);

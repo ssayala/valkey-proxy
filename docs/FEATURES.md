@@ -117,8 +117,8 @@ directly affect command behavior are listed here:
 
 | Setting | Default | Effect |
 |---|---|---|
-| `min_normal_connection` / `max_normal_connection` | 2 / 20 | Pool used by the vast majority of read/write commands |
-| `min_blocking_connection` / `max_blocking_connection` | 2 / 10 | `BLPOP` and other blocking commands |
+| `min_normal_connection` / `max_normal_connection` | 0 / 20 | Pool for commands that still use the one-at-a-time path (most commands use the shared pipelined connections instead); grown on demand in the background |
+| `min_blocking_connection` / `max_blocking_connection` | 0 / 10 | `BLPOP` and other blocking commands; grown on demand |
 | `min_subscription_connection` / `max_subscription_connection` | 0 / 10 | Pub/Sub |
 | `min_transaction_connection` / `max_transaction_connection` | 0 / 10 | Unused: transactions use pinned connections (see 2a) |
 | `min_acl_connection` / `max_acl_connection` | 0 / 10 | `ACL`/`AUTH`, plus each authenticated client's dedicated per-node connections |

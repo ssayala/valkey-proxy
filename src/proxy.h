@@ -310,7 +310,7 @@ struct ClientConn {
     int hello_auth_protover;
     /* ── CLIENT INFO metadata (see format_client_info_line in fanout.c) ── */
     char addr[280];  /* peer ip:port, or "<unix_socket_path>:0" */
-    char laddr[280]; /* proxy-side local ip:port for this connection */
+    char laddr[280]; /* proxy-side local ip:port; filled on first use (client_laddr()) */
     time_t connect_time;
     time_t last_interaction;
     char last_cmd[40]; /* lowercase "cmd" or "cmd|subcommand" */
@@ -474,6 +474,7 @@ typedef struct {
     int max_command_size; /* largest single client command accepted */
     int client_timeout;        /* "timeout": close clients idle this many seconds (0 = never) */
     int shutdown_timeout;      /* seconds to drain clients after SIGTERM before exiting */
+    int tcp_keepalive;         /* SO_KEEPALIVE idle seconds on client/backend sockets (0 = off) */
     int unix_socket_perm;      /* chmod for the unix socket, 0 = leave the umask default */
     int tls_handshake_timeout; /* seconds a client gets to finish its TLS handshake */
     int worker_cpu_affinity; /* pin worker i to CPU (cpu_affinity_base + i) */
@@ -539,22 +540,33 @@ static inline void fd_watch(Worker *w, int fd, int events) {
         if (events & EL_WRITABLE) worker_want_flush(w, fd);
         return;
     }
-    w->fd_mask[fd] |= (uint8_t)events;
-    el_add(w->el, fd, w->fd_mask[fd]);
+    uint8_t mask = w->fd_mask[fd] | (uint8_t)events;
+    if (mask == w->fd_mask[fd]) return; /* already registered for these: skip the epoll_ctl */
+    w->fd_mask[fd] = mask;
+    el_add(w->el, fd, mask);
 }
 static inline void fd_unwatch(Worker *w, int fd, int events) {
     if (fd < 0 || fd >= g_config.max_connection) return;
     if (w->uring_fd && w->uring_fd[fd]) return;
-    w->fd_mask[fd] &= (uint8_t)~events;
-    if (w->fd_mask[fd])
-        el_add(w->el, fd, w->fd_mask[fd]);
+    uint8_t mask = w->fd_mask[fd] & (uint8_t)~events;
+    if (mask == w->fd_mask[fd]) return;
+    w->fd_mask[fd] = mask;
+    if (mask)
+        el_add(w->el, fd, mask);
     else
         el_del(w->el, fd);
+}
+/* A newly opened fd: forget whatever mask a previous socket with the same
+ * number left behind (fd_watch() trusts the mask to skip redundant calls). */
+static inline void fd_reset(Worker *w, int fd) {
+    if (fd >= 0 && fd < g_config.max_connection) w->fd_mask[fd] = 0;
 }
 
 /* ── config / network ───────────────────────────────────────────────── */
 void parse_conf(const char *path);
 void set_nonblocking(int fd);
+/* TCP keepalive per tcp-keepalive, the way Valkey's anetKeepAlive() does it. */
+void set_tcp_keepalive(int fd);
 int tcp_connect(const char *ip, int port);
 int tcp_connect_timeout(const char *ip, int port, int timeout_ms);
 int tcp_connect_addr(const struct sockaddr_storage *sa, socklen_t salen, const char *ip, int port, int timeout_ms);
@@ -681,6 +693,9 @@ int cmd_resp3_pair_transform(const char *cmd);
 
 /* ── client helpers ─────────────────────────────────────────────────── */
 void client_send_error(Worker *w, ClientConn *client, const char *msg);
+/* The proxy-side address of client's connection, looked up on first use
+ * (only CLIENT INFO needs it, so accept() doesn't pay a getsockname()). */
+const char *client_laddr(ClientConn *client);
 void client_send_crossslot(ClientConn *client);
 void close_client(Worker *w, ClientConn *client);
 void resume_client_after_conn(Worker *w, ClientConn *client, PoolConn *conn);

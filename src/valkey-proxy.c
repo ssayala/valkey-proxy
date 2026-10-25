@@ -7,7 +7,9 @@
 #include <signal.h>
 
 /* ── global definitions ─────────────────────────────────────────────── */
-int g_pool_min[POOL_TYPE_COUNT] = {2, 2, 0, 0, 0};
+/* All on-demand: ordinary traffic uses the shared muxes (mux.c), and pools
+ * grow in the background when the legacy paths do need them (pool.c). */
+int g_pool_min[POOL_TYPE_COUNT] = {0, 0, 0, 0, 0};
 int g_pool_max[POOL_TYPE_COUNT] = {20, 10, 10, 10, 10};
 
 Config g_config;
@@ -79,6 +81,17 @@ static int format_sockaddr(struct sockaddr_storage *sa, char *out, int cap) {
     return 0;
 }
 
+const char *client_laddr(ClientConn *client) {
+    if (!client->laddr[0]) {
+        struct sockaddr_storage lsa;
+        socklen_t lsalen = sizeof(lsa);
+        if (getsockname(client->fd, (struct sockaddr *)&lsa, &lsalen) != 0 ||
+            !format_sockaddr(&lsa, client->laddr, sizeof(client->laddr)))
+            snprintf(client->laddr, sizeof(client->laddr), "%s:0", g_config.unix_socket_path);
+    }
+    return client->laddr;
+}
+
 /* ── accept ─────────────────────────────────────────────────────────── */
 static void do_accept(Worker *w, int listen_fd) {
     /* listen_fd is registered edge-triggered (EPOLLET): a single readiness
@@ -88,7 +101,11 @@ static void do_accept(Worker *w, int listen_fd) {
     for (;;) {
         struct sockaddr_storage sa;
         socklen_t salen = sizeof(sa);
+#ifdef __linux__
+        int fd = accept4(listen_fd, (struct sockaddr *)&sa, &salen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#else
         int fd = accept(listen_fd, (struct sockaddr *)&sa, &salen);
+#endif
         if (fd < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) perror("accept");
             return;
@@ -97,11 +114,15 @@ static void do_accept(Worker *w, int listen_fd) {
             close(fd);
             continue;
         }
+#ifndef __linux__
         set_nonblocking(fd);
+#endif
         if (sa.ss_family == AF_INET || sa.ss_family == AF_INET6) {
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            set_tcp_keepalive(fd);
         }
+        fd_reset(w, fd);
 
         ClientConn *client = calloc(1, sizeof(ClientConn));
         if (!client) {
@@ -119,11 +140,6 @@ static void do_accept(Worker *w, int listen_fd) {
         if (!format_sockaddr(&sa, client->addr, sizeof(client->addr)))
             snprintf(client->addr, sizeof(client->addr), "%s:0", g_config.unix_socket_path);
 
-        struct sockaddr_storage lsa;
-        socklen_t lsalen = sizeof(lsa);
-        if (getsockname(fd, (struct sockaddr *)&lsa, &lsalen) != 0 ||
-            !format_sockaddr(&lsa, client->laddr, sizeof(client->laddr)))
-            snprintf(client->laddr, sizeof(client->laddr), "%s:0", g_config.unix_socket_path);
 
 #ifdef USE_TLS
         /* TCP clients only (a local unix socket stays plaintext). The

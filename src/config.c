@@ -23,6 +23,7 @@ void parse_conf(const char *path) {
     g_config.max_command_size = 512 * 1024 * 1024;
     g_config.tls_handshake_timeout = 10;
     g_config.shutdown_timeout = 10;
+    g_config.tcp_keepalive = 300; /* same default as Valkey */
 #ifdef USE_IOURING
     g_config.io_uring = 1; /* built in on purpose: on unless "io-uring no" */
 #endif
@@ -74,6 +75,8 @@ void parse_conf(const char *path) {
             g_config.cluster_refresh_interval_ms = atoi(val);
         else if (!strcmp(key, "cluster_node_fail_grace_ms"))
             g_config.cluster_node_fail_grace_ms = atoi(val);
+        else if (!strcmp(key, "tcp-keepalive"))
+            g_config.tcp_keepalive = atoi(val);
         else if (!strcmp(key, "shutdown-timeout"))
             g_config.shutdown_timeout = atoi(val);
         else if (!strcmp(key, "unix-socket-perm"))
@@ -130,6 +133,21 @@ void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+void set_tcp_keepalive(int fd) {
+    int idle = g_config.tcp_keepalive;
+    if (idle <= 0) return;
+    int yes = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes)) < 0) return;
+#ifdef __linux__
+    /* Probe after `idle` seconds, then every idle/3, give up after 3 misses:
+     * a vanished peer is detected within about 2x tcp-keepalive. */
+    int intvl = idle / 3 > 0 ? idle / 3 : 1, cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+}
+
 /* timeout_ms bounds only the "still connecting" wait (TCP handshake in
  * flight); ECONNREFUSED and similar immediate errors return right away
  * regardless of it. Kept separate from tcp_connect() below because the
@@ -177,6 +195,7 @@ int tcp_connect_addr(const struct sockaddr_storage *sa, socklen_t salen, const c
     }
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    set_tcp_keepalive(fd);
 
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);

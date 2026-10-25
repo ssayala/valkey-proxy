@@ -68,6 +68,7 @@ static void pool_add_conn(Worker *w, ConnPool *p, int fd, TlsConn *ssl, int star
     c->db = p->db;
     c->pool = p;
     if (fd < g_config.max_connection) w->backend_map[fd] = c;
+    fd_reset(w, fd);
     fd_watch(w, fd, EL_READABLE);
     if (startup)
         printf("        [%d] fd=%-4d  %s:%d  db=%d\n", p->count, fd, node->ip, node->port, p->db);
@@ -307,6 +308,7 @@ PoolConn *pool_acquire_nb(Worker *w, ConnPool *p) {
             c->db = p->db;
             c->pool = p;
             if (fd < g_config.max_connection) w->backend_map[fd] = c;
+            fd_reset(w, fd);
             fd_watch(w, fd, EL_READABLE);
             LOG_VERBOSE("  [%s pool] node [%s:%d] db=%d: new conn fd=%d (%d/%d)\n", POOL_NAME[p->type], node->ip, node->port,
                    p->db, fd, p->count + 1, p->max);
