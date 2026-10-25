@@ -54,6 +54,7 @@ TEST_SRCS = test/run-test.c test/acl/test_acl.c test/acl/acl_fixture.c test/bitm
             test/string/test_string.c \
             test/zset/test_zset.c \
             test/pipeline/test_pipeline.c \
+            test/txn/test_txn.c \
             test/resp3/test_resp3.c \
             test/modules/bloomfilter/test_bloomfilter.c \
             test/modules/json/test_json.c \

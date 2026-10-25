@@ -1,6 +1,8 @@
 # valkey-proxy
 
-A single-threaded, non-blocking proxy for Valkey/Redis Cluster written in C. It routes commands to the correct shard based on CRC16 key hashing, handles `MOVED` redirects automatically, and fans out multi-key commands across nodes.
+A non-blocking, multi-threaded proxy for Valkey/Redis Cluster written in C. It routes commands to the correct shard based on CRC16 key hashing, follows `MOVED`/`ASK` redirects transparently, and fans out multi-key commands across nodes.
+
+Plain single-key commands from all clients of a worker thread are pipelined over one shared connection per backend node, so client pipelining (`valkey-benchmark -P 16`, client-library pipelines) is fully supported, and replies always come back in command order. `MULTI`/`EXEC`/`WATCH` run on a connection pinned to the client for the duration of the transaction, and inline (telnet-style) commands are accepted.
 
 ## Build
 
@@ -53,6 +55,12 @@ tls-enabled  no
 
 # Unix domain socket (optional)
 # unix-socket  /tmp/valkey-proxy.sock
+
+# Per-command / per-connection trace logging (default: no)
+# verbose  yes
+
+# Largest single client command accepted, in bytes (default: 512MB)
+# max_command_size  536870912
 ```
 
 ## Run

@@ -1,5 +1,6 @@
 #include "proxy.h"
 #include <netinet/tcp.h>
+#include <stddef.h>
 
 /* ── pipelined fast path ────────────────────────────────────────────────
  *
@@ -28,6 +29,9 @@
 #define CLIENT_MAX_PENDING_OUT (4 * 1024 * 1024) /* stop parsing while this much reply data is unflushed */
 #define CLIENT_READ_PAUSE      (4 * 1024 * 1024) /* stop reading while this much input is unparsed */
 #define IO_CHUNK               16384
+#define MAX_REDIRECTS          5
+#define MAX_RETAINED_CMD       65536 /* larger commands aren't kept for MOVED/ASK retry */
+#define MAX_INLINE_LINE        65536
 
 /* ── intrusive worker lists ─────────────────────────────────────────── */
 static void pw_add(Worker *w, ClientConn *c) {
@@ -97,14 +101,25 @@ static Req *req_new(Worker *w) {
         w->req_free = r->mnext;
     else if (!(r = malloc(sizeof(Req))))
         return NULL;
-    memset(r, 0, sizeof(*r));
+    memset(r, 0, offsetof(Req, cmd_inl));
     return r;
 }
 static void req_free(Worker *w, Req *r) {
     free(r->reply);
     r->reply = NULL;
+    if (r->cmd != r->cmd_inl) free(r->cmd);
+    r->cmd = NULL;
     r->mnext = w->req_free;
     w->req_free = r;
+}
+
+/* Keeps a copy of the command so a MOVED/ASK reply can be retried. */
+static void req_keep_cmd(Req *r, const char *data, int len) {
+    if (len > MAX_RETAINED_CMD) return;
+    r->cmd = len <= (int)sizeof(r->cmd_inl) ? r->cmd_inl : malloc((size_t)len);
+    if (!r->cmd) return;
+    memcpy(r->cmd, data, (size_t)len);
+    r->cmd_len = len;
 }
 
 /* ── buffers ────────────────────────────────────────────────────────── */
@@ -149,10 +164,49 @@ static void client_rq_pop(ClientConn *c) {
     c->rq_count--;
 }
 
+/* A fan-out sub-request's reply: store it the way the pooled path did
+ * (handle_fanout_sub_readable() in fanout.c) and aggregate once every sub
+ * of the command is in. `failed` = the connection broke rather than the
+ * backend answering. */
+static void sub_deliver(Worker *w, FanoutSub *sub, const char *data, int len, int failed) {
+    FanoutCtx *ctx = sub->ctx;
+    sub->req = NULL;
+    if (failed) {
+        sub->error = 1;
+    } else {
+        char *buf = malloc((size_t)len);
+        if (!buf) {
+            sub->error = 1;
+        } else {
+            memcpy(buf, data, (size_t)len);
+            free(sub->rbuf);
+            sub->rbuf = buf;
+            sub->rbuf_len = sub->rbuf_cap = len;
+        }
+    }
+    sub->done = 1;
+    if (sub->error) ctx->had_error = 1;
+    ctx->ndone++;
+    if (ctx->ndone == ctx->nsubs) fanout_aggregate_and_reply(w, ctx);
+}
+
 /* Request r (already off any mux FIFO) has its reply. If it's next in its
  * client's order, write it straight to the client along with any later
  * replies that were held back waiting for it; otherwise park a copy. */
-static void req_deliver(Worker *w, Req *r, const char *data, int len) {
+static void req_deliver_ex(Worker *w, Req *r, const char *data, int len, int failed) {
+    if (r->client && r->inflight_kind) {
+        if (r->inflight_kind == 2)
+            r->client->pin_inflight--;
+        else
+            r->client->shared_inflight--;
+        r->inflight_kind = 0;
+    }
+    if (r->sub) {
+        FanoutSub *sub = r->sub;
+        req_free(w, r);
+        sub_deliver(w, sub, data, len, failed);
+        return;
+    }
     ClientConn *c = r->client;
     if (!c) {
         if (r->internal && len > 0 && data[0] == '-')
@@ -182,6 +236,10 @@ static void req_deliver(Worker *w, Req *r, const char *data, int len) {
         client_rq_pop(c);
         req_free(w, r);
     }
+}
+
+static void req_deliver(Worker *w, Req *r, const char *data, int len) {
+    req_deliver_ex(w, r, data, len, 0);
 }
 
 /* Proxy-generated reply that must still respect the client's reply order
@@ -232,11 +290,26 @@ void client_detach_requests(Worker *w, ClientConn *c) {
 }
 
 /* ── mux connections ────────────────────────────────────────────────── */
+static void tx_reset(ClientConn *c);
+
 static void mux_destroy(Worker *w, MuxConn *m) {
     pf_remove(w, m);
     if (m->owner) {
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 2; i++) {
             if (m->owner->mux[i] == m) m->owner->mux[i] = NULL;
+            for (MuxConn **pp = &m->owner->tx_idle[i]; *pp; pp = &(*pp)->idle_next)
+                if (*pp == m) {
+                    *pp = m->idle_next;
+                    break;
+                }
+        }
+    }
+    if (m->pin_client && m->pin_client->pin == m) {
+        /* Pinned connection died mid-WATCH/MULTI: the backend's transaction
+         * state is gone, so the client's is too (as with a lost server
+         * connection). */
+        m->pin_client->pin = NULL;
+        tx_reset(m->pin_client);
     }
     if (m->fd >= 0) {
         fd_unwatch(w, m->fd, EL_READABLE | EL_WRITABLE);
@@ -262,7 +335,7 @@ static void mux_fail(Worker *w, MuxConn *m, const char *msg) {
     m->inflight = 0;
     while (r) {
         Req *next = r->mnext;
-        req_deliver(w, r, err, n);
+        req_deliver_ex(w, r, err, n, 1);
         r = next;
     }
     mux_destroy(w, m);
@@ -285,6 +358,19 @@ static void mux_enqueue(Worker *w, MuxConn *m, Req *r, const char *data, int len
     m->tail = r;
     m->inflight++;
     pf_add(w, m);
+}
+
+/* A draining mux just went idle: a released transaction connection goes back
+ * to its node's idle list for reuse, anything else is closed. */
+static void mux_drained(Worker *w, MuxConn *m) {
+    if (m->reusable && m->owner && m->owner->gen == m->gen) {
+        int ri = m->resp == 3;
+        m->draining = 0;
+        m->idle_next = m->owner->tx_idle[ri];
+        m->owner->tx_idle[ri] = m;
+        return;
+    }
+    mux_destroy(w, m);
 }
 
 static void mux_internal_cmd(Worker *w, MuxConn *m, const char *cmd, int len) {
@@ -326,6 +412,7 @@ static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
     m->resp = resp;
     m->connecting = rc < 0;
     m->owner = np;
+    m->gen = np->gen;
     w->mux_map[fd] = m;
     fd_watch(w, fd, EL_READABLE | (m->connecting ? EL_WRITABLE : 0));
 
@@ -346,14 +433,19 @@ static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
     return m;
 }
 
-static MuxConn *mux_for(Worker *w, ClientConn *c, int node_idx) {
+static NodePools *client_np(Worker *w, ClientConn *c, int node_idx) {
     if (!c->fast_np || c->fast_db != c->db) {
         DbGroup *grp = db_group_get(w, c->db);
         if (!grp) return NULL;
         c->fast_np = grp->node_pools;
         c->fast_db = c->db;
     }
-    NodePools *np = &c->fast_np[node_idx];
+    return &c->fast_np[node_idx];
+}
+
+static MuxConn *mux_for(Worker *w, ClientConn *c, int node_idx) {
+    NodePools *np = client_np(w, c, node_idx);
+    if (!np) return NULL;
     int ri = c->resp == 3;
     MuxConn *m = np->mux[ri];
     if (!m) m = np->mux[ri] = mux_create(w, np, c->db, c->resp == 3 ? 3 : 2);
@@ -391,6 +483,70 @@ void handle_mux_writable(Worker *w, MuxConn *m) {
         m->connecting = 0;
     }
     mux_flush(w, m);
+}
+
+static MuxConn *mux_for_db(Worker *w, int db, int node_idx, int resp) {
+    DbGroup *grp = db_group_get(w, db);
+    if (!grp) return NULL;
+    NodePools *np = &grp->node_pools[node_idx];
+    int ri = resp == 3;
+    if (!np->mux[ri]) np->mux[ri] = mux_create(w, np, db, resp);
+    return np->mux[ri];
+}
+
+/* "-MOVED <slot> <host>:<port>" / "-ASK <slot> <host>:<port>" for a request
+ * on a shared mux: resend it to the node named in the reply (behind ASKING
+ * for ASK) instead of handing the redirect to a client that can't act on
+ * it. MOVED also patches this worker's slot map at once and asks for a full
+ * topology refresh. Returns 1 if r was re-queued. */
+static int mux_try_redirect(Worker *w, MuxConn *m, Req *r, const char *d, int len) {
+    int ask;
+    const char *p;
+    if (len > 7 && !memcmp(d, "-MOVED ", 7)) {
+        ask = 0;
+        p = d + 7;
+    } else if (len > 5 && !memcmp(d, "-ASK ", 5)) {
+        ask = 1;
+        p = d + 5;
+    } else {
+        return 0;
+    }
+    if (!ask) topology_request_refresh();
+    if (!r->cmd || r->redirects >= MAX_REDIRECTS || (!r->client && !r->sub)) return 0;
+
+    const char *end = d + len;
+    int slot = 0;
+    while (p < end && *p >= '0' && *p <= '9') slot = slot * 10 + (*p++ - '0');
+    if (p >= end || *p != ' ' || slot >= CLUSTER_SLOTS) return 0;
+    const char *host = ++p;
+    const char *eol = memchr(host, '\r', (size_t)(end - host));
+    if (!eol) return 0;
+    const char *colon = eol;
+    while (colon > host && *colon != ':') colon--;
+    if (colon == host) return 0;
+    int hlen = (int)(colon - host), port = atoi(colon + 1);
+
+    int idx = -1;
+    for (int i = 0; i < w->topo.node_count; i++)
+        if (w->topo.nodes[i].port == port && (int)strlen(w->topo.nodes[i].ip) == hlen &&
+            !memcmp(w->topo.nodes[i].ip, host, (size_t)hlen)) {
+            idx = i;
+            break;
+        }
+    if (idx < 0) return 0; /* unknown node: let the refresh find it, pass the error on */
+    if (!ask) w->topo.slot_map[slot] = idx;
+
+    MuxConn *t = mux_for_db(w, m->db, idx, m->resp);
+    if (!t) return 0;
+    if (ask) {
+        static const char ASKING[] = "*1\r\n$6\r\nASKING\r\n";
+        mux_internal_cmd(w, t, ASKING, (int)sizeof(ASKING) - 1);
+    }
+    r->redirects++;
+    LOG_VERBOSE("[worker %d] %s slot %d -> %s:%d\n", w->thread_id, ask ? "ASK" : "MOVED", slot,
+                w->topo.nodes[idx].ip, port);
+    mux_enqueue(w, t, r, r->cmd, r->cmd_len);
+    return 1;
 }
 
 void handle_mux_readable(Worker *w, MuxConn *m) {
@@ -432,12 +588,14 @@ void handle_mux_readable(Worker *w, MuxConn *m) {
             if (!m->head) m->tail = NULL;
             m->inflight--;
             r->mnext = NULL;
-            req_deliver(w, r, m->rbuf + m->rbuf_off, rl);
+            const char *reply = m->rbuf + m->rbuf_off;
             m->rbuf_off += rl;
+            if (reply[0] == '-' && !r->internal && !m->pin_client && mux_try_redirect(w, m, r, reply, rl)) continue;
+            req_deliver(w, r, reply, rl);
         }
         if (n < space) break; /* socket drained (edge-triggered: no more data until next edge) */
     }
-    if (m->draining && m->inflight == 0) mux_destroy(w, m);
+    if (m->draining && m->inflight == 0) mux_drained(w, m);
 }
 
 /* Topology moved node np->node_idx to a new identity (failover / eviction --
@@ -445,6 +603,10 @@ void handle_mux_readable(Worker *w, MuxConn *m) {
  * node still owns slots the in-flight ones are allowed to finish, otherwise
  * nothing will ever answer them, so they fail now. */
 void mux_node_changed(Worker *w, NodePools *np, int still_owns_slots) {
+    for (int i = 0; i < 2; i++) {
+        MuxConn *idle;
+        while ((idle = np->tx_idle[i])) mux_destroy(w, idle); /* unlinks itself */
+    }
     for (int i = 0; i < 2; i++) {
         MuxConn *m = np->mux[i];
         if (!m) continue;
@@ -457,6 +619,29 @@ void mux_node_changed(Worker *w, NodePools *np, int still_owns_slots) {
         else
             m->draining = 1;
     }
+}
+
+/* ── fan-out sub-requests ───────────────────────────────────────────── */
+void fanout_send_sub(Worker *w, FanoutSub *sub, const char *cmd, int len) {
+    sub->conn = NULL;
+    sub->req = NULL;
+    /* Always RESP2: every fanout_agg_*() parses RESP2 sub-replies. */
+    MuxConn *m = (sub->node_idx >= 0 && sub->node_idx < w->topo.node_count)
+                     ? mux_for_db(w, sub->ctx->client->db, sub->node_idx, 2)
+                     : NULL;
+    Req *r = m ? req_new(w) : NULL;
+    if (!r) {
+        /* Not sub_deliver(): callers are still looping over ctx->subs and
+         * aggregate themselves once ndone == nsubs after the loop. */
+        sub->error = sub->done = 1;
+        sub->ctx->had_error = 1;
+        sub->ctx->ndone++;
+        return;
+    }
+    r->sub = sub;
+    sub->req = r;
+    req_keep_cmd(r, cmd, len);
+    mux_enqueue(w, m, r, cmd, len);
 }
 
 /* ── client input ───────────────────────────────────────────────────── */
@@ -534,6 +719,391 @@ static void client_protocol_error(Worker *w, ClientConn *c, const char *msg) {
     pw_add(w, c);
 }
 
+/* Appends a new request to the end of c's reply order. */
+static Req *client_req_new(Worker *w, ClientConn *c) {
+    Req *r = req_new(w);
+    if (!r) {
+        c->close_asap = 1;
+        pw_add(w, c);
+        return NULL;
+    }
+    r->client = c;
+    if (c->rq_tail)
+        c->rq_tail->cnext = r;
+    else
+        c->rq_head = r;
+    c->rq_tail = r;
+    c->rq_count++;
+    return r;
+}
+
+static void client_reply_str(Worker *w, ClientConn *c, const char *s) {
+    client_reply_ordered(w, c, s, (int)strlen(s));
+}
+
+/* ── inline commands ────────────────────────────────────────────────── */
+static int hexval(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+/* Converts one inline command line (telnet-style "SET k v") into RESP in
+ * c->conv, splitting on whitespace with Valkey's quoting rules ("..." with
+ * \n \r \t \b \a \\ \" \xHH escapes, '...' with \' only). Returns the RESP
+ * length, 0 for a blank line, or -1 on unbalanced quotes / OOM. */
+static int inline_to_resp(ClientConn *c, const char *line, int len) {
+    char *args = malloc((size_t)len + 1); /* unescaped args are never longer than the line */
+    if (!args) return -1;
+    int arg_off[1024], arg_len[1024], argc = 0, alen = 0;
+    const char *p = line, *end = line + len;
+    for (;;) {
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        if (p >= end) break;
+        if (argc == 1024) goto bad;
+        int start = alen;
+        char q = *p;
+        if (q == '"' || q == '\'') {
+            p++;
+            for (;;) {
+                if (p >= end) goto bad;
+                if (*p == q) {
+                    p++;
+                    break;
+                }
+                char ch = *p++;
+                if (ch == '\\' && p < end) {
+                    if (q == '\'') {
+                        if (*p == '\'') ch = *p++;
+                    } else {
+                        ch = *p++;
+                        if (ch == 'x' && p + 1 < end && hexval(p[0]) >= 0 && hexval(p[1]) >= 0) {
+                            ch = (char)(hexval(p[0]) * 16 + hexval(p[1]));
+                            p += 2;
+                        } else if (ch == 'n') {
+                            ch = '\n';
+                        } else if (ch == 'r') {
+                            ch = '\r';
+                        } else if (ch == 't') {
+                            ch = '\t';
+                        } else if (ch == 'b') {
+                            ch = '\b';
+                        } else if (ch == 'a') {
+                            ch = '\a';
+                        }
+                    }
+                }
+                args[alen++] = ch;
+            }
+            if (p < end && *p != ' ' && *p != '\t') goto bad; /* closing quote must end the arg */
+        } else {
+            while (p < end && *p != ' ' && *p != '\t') args[alen++] = *p++;
+        }
+        arg_off[argc] = start;
+        arg_len[argc] = alen - start;
+        argc++;
+    }
+    if (argc == 0) {
+        free(args);
+        return 0;
+    }
+    int need = 16 + argc * 16 + alen;
+    if (c->conv_cap < need) {
+        char *tmp = realloc(c->conv, (size_t)need);
+        if (!tmp) goto bad;
+        c->conv = tmp;
+        c->conv_cap = need;
+    }
+    int o = snprintf(c->conv, (size_t)c->conv_cap, "*%d\r\n", argc);
+    for (int i = 0; i < argc; i++) {
+        o += snprintf(c->conv + o, (size_t)(c->conv_cap - o), "$%d\r\n", arg_len[i]);
+        memcpy(c->conv + o, args + arg_off[i], (size_t)arg_len[i]);
+        o += arg_len[i];
+        c->conv[o++] = '\r';
+        c->conv[o++] = '\n';
+    }
+    free(args);
+    return o;
+bad:
+    free(args);
+    return -1;
+}
+
+/* ── transactions ───────────────────────────────────────────────────────
+ * WATCH and MULTI pin the client to a private backend connection (taken
+ * from the node's tx_idle list when possible) so the backend sees the whole
+ * WATCH ... MULTI ... EXEC sequence on one connection and applies its own
+ * rules (CROSSSLOT, EXECABORT, watched-key invalidation). MULTI is answered
+ * locally and the node is picked by the transaction's first keyed command;
+ * keyless commands before that are answered +QUEUED locally and replayed
+ * once the node is known. */
+static void tx_reset(ClientConn *c) {
+    c->tx_state = 0;
+    c->tx_dirty = 0;
+    c->txq_len = 0;
+    c->in_transaction = 0;
+    c->multi_count = -1;
+    c->watch_count = 0;
+}
+
+static void tx_release(Worker *w, ClientConn *c, int reusable) {
+    MuxConn *m = c->pin;
+    if (!m) return;
+    c->pin = NULL;
+    m->pin_client = NULL;
+    m->reusable = m->reusable && reusable;
+    m->draining = 1;
+    if (m->inflight == 0) mux_drained(w, m);
+}
+
+static void tx_end(Worker *w, ClientConn *c) {
+    tx_release(w, c, 1);
+    tx_reset(c);
+}
+
+/* Client closing: its pinned connection may hold WATCH/MULTI state, so it's
+ * never reused. */
+void client_release_tx(Worker *w, ClientConn *c) {
+    tx_release(w, c, 0);
+    free(c->txq);
+    c->txq = NULL;
+    c->txq_cap = 0;
+    free(c->conv);
+    c->conv = NULL;
+}
+
+static MuxConn *tx_pin(Worker *w, ClientConn *c, int node_idx) {
+    NodePools *np = client_np(w, c, node_idx);
+    if (!np) return NULL;
+    int ri = c->resp == 3;
+    MuxConn *m = NULL;
+    if (!c->acl_authenticated && (m = np->tx_idle[ri])) {
+        np->tx_idle[ri] = m->idle_next;
+        m->idle_next = NULL;
+    } else {
+        m = mux_create(w, np, c->db, c->resp == 3 ? 3 : 2);
+        if (!m) return NULL;
+        if (c->acl_authenticated) {
+            const char *a[3] = {"AUTH", c->acl_user, c->acl_pass};
+            int al[3] = {4, c->acl_userlen, c->acl_passlen};
+            int n;
+            char *auth = build_resp_cmd(a[0], al[0], a + 1, al + 1, 2, &n);
+            if (auth) {
+                mux_internal_cmd(w, m, auth, n);
+                free(auth);
+            }
+        }
+    }
+    m->pin_client = c;
+    m->reusable = !c->acl_authenticated;
+    m->draining = 0;
+    c->pin = m;
+    return m;
+}
+
+static void tx_forward(Worker *w, ClientConn *c, const char *p, int len) {
+    Req *r = client_req_new(w, c);
+    if (!r) return;
+    r->inflight_kind = 2;
+    c->pin_inflight++;
+    mux_enqueue(w, c->pin, r, p, len);
+}
+
+/* Node owning the command's first key, -1 if it has none, -2 if the slot is
+ * unmapped. */
+static int cmd_first_key_node(Worker *w, const CmdInfo *ci, const char *cmd, const char *p, int len, const char *kp,
+                              int kl) {
+    const char *k = NULL;
+    int klen = 0;
+    if (ci->cls == CMD_CLASS_SINGLE_KEY && !ci->container && kl > 0) {
+        k = kp;
+        klen = kl;
+    } else if (ci->cls == CMD_CLASS_MULTI_KEY) {
+        if (resp_extract_keys(p, len, cmd, &k, &klen, 1) < 1) k = NULL;
+    } else if (ci->cls == CMD_CLASS_BLOCKING) {
+        if (resp_extract_blocking_keys(p, len, cmd, &k, &klen, 1) < 1) k = NULL;
+    }
+    if (!k) return -1;
+    int ni = w->topo.slot_map[key_slot(k, klen)];
+    return (ni < 0 || ni >= w->topo.node_count) ? -2 : ni;
+}
+
+/* Commands the proxy can't run on a pinned transaction connection: they
+ * change connection-level state the proxy tracks itself, or are answered by
+ * the proxy rather than a backend. */
+static int tx_denied(const CmdInfo *ci, const char *cmd) {
+    if (!ci) return 1;
+    if (ci->cls == CMD_CLASS_PUBSUB || ci->cls == CMD_CLASS_ACL) return 1;
+    static const char *DENY[] = {"HELLO", "SELECT", "CLIENT", "ACL", "AUTH", "RESET", "MODULE", NULL};
+    for (int i = 0; DENY[i]; i++)
+        if (!strcmp(cmd, DENY[i])) return 1;
+    return 0;
+}
+
+/* Handles c's command if it belongs to a transaction: returns 1 if handled,
+ * 0 to let the normal routing take it, 2 if it must wait for c's in-flight
+ * shared-connection requests first (see ClientConn.shared_inflight). */
+static int tx_handle(Worker *w, ClientConn *c, const char *cmd, const CmdInfo *ci, const char *p, int len,
+                     const char *kp, int kl, int argc) {
+    int is_multi = !strcmp(cmd, "MULTI"), is_exec = !strcmp(cmd, "EXEC"), is_discard = !strcmp(cmd, "DISCARD"),
+        is_watch = !strcmp(cmd, "WATCH"), is_unwatch = !strcmp(cmd, "UNWATCH");
+    int txn_cmd = is_multi || is_exec || is_discard || is_watch || is_unwatch;
+    if (c->tx_state < 2 && !txn_cmd) return 0; /* between WATCH and MULTI: route normally */
+    if (c->shared_inflight > 0) return 2;
+
+    c->last_interaction = w->now;
+    record_last_cmd(c, cmd, kp, kl);
+
+    if (c->tx_state == 2 && !is_multi && !is_exec && !is_discard && !is_watch) {
+        /* Queued command (UNWATCH included: inside MULTI it's just queued). */
+        if (tx_denied(ci, cmd)) {
+            char e[160];
+            snprintf(e, sizeof(e), "-ERR '%.40s' is not supported inside a transaction by the proxy\r\n", cmd);
+            client_reply_str(w, c, e);
+            c->tx_dirty = 1;
+            return 1;
+        }
+        c->multi_count++;
+        if (c->pin) {
+            tx_forward(w, c, p, len);
+            return 1;
+        }
+        int ni = cmd_first_key_node(w, ci, cmd, p, len, kp, kl);
+        if (ni == -2) {
+            client_reply_error(w, c, "slot not mapped");
+            c->tx_dirty = 1;
+            return 1;
+        }
+        if (ni == -1) {
+            if (buf_reserve(&c->txq, &c->txq_len, NULL, &c->txq_cap, len) < 0) {
+                c->close_asap = 1;
+                pw_add(w, c);
+                return 1;
+            }
+            memcpy(c->txq + c->txq_len, p, (size_t)len);
+            c->txq_len += len;
+            client_reply_str(w, c, "+QUEUED\r\n");
+            return 1;
+        }
+        if (!tx_pin(w, c, ni)) {
+            client_reply_error(w, c, "backend connection error");
+            c->tx_dirty = 1;
+            return 1;
+        }
+        goto send_multi_and_queue;
+    }
+
+    if (is_watch) {
+        if (c->tx_state == 2) {
+            client_reply_str(w, c, "-ERR WATCH inside MULTI is not allowed\r\n");
+            return 1;
+        }
+        if (argc < 2) {
+            client_reply_str(w, c, "-ERR wrong number of arguments for 'watch' command\r\n");
+            return 1;
+        }
+        if (!c->pin) {
+            int ni = w->topo.slot_map[key_slot(kp, kl)];
+            if (ni < 0 || ni >= w->topo.node_count) {
+                client_reply_error(w, c, "slot not mapped");
+                return 1;
+            }
+            if (!tx_pin(w, c, ni)) {
+                client_reply_error(w, c, "backend connection error");
+                return 1;
+            }
+        }
+        c->tx_state = 1;
+        c->watch_count += argc - 1;
+        tx_forward(w, c, p, len);
+        return 1;
+    }
+    if (is_multi) {
+        if (c->tx_state == 2) {
+            client_reply_str(w, c, "-ERR MULTI calls can not be nested\r\n");
+            return 1;
+        }
+        c->tx_state = 2;
+        c->tx_dirty = 0;
+        c->txq_len = 0;
+        c->in_transaction = 1;
+        c->multi_count = 0;
+        if (c->pin)
+            tx_forward(w, c, p, len);
+        else
+            client_reply_str(w, c, "+OK\r\n");
+        return 1;
+    }
+    if (is_unwatch) { /* tx_state < 2 */
+        if (c->pin)
+            tx_forward(w, c, p, len);
+        else
+            client_reply_str(w, c, "+OK\r\n");
+        tx_end(w, c);
+        return 1;
+    }
+    if (is_discard) {
+        if (c->tx_state != 2) {
+            client_reply_str(w, c, "-ERR DISCARD without MULTI\r\n");
+            return 1;
+        }
+        if (c->pin)
+            tx_forward(w, c, p, len);
+        else
+            client_reply_str(w, c, "+OK\r\n");
+        tx_end(w, c);
+        return 1;
+    }
+    /* EXEC */
+    if (c->tx_state != 2) {
+        client_reply_str(w, c, "-ERR EXEC without MULTI\r\n");
+        return 1;
+    }
+    if (c->tx_dirty) {
+        if (c->pin) mux_internal_cmd(w, c->pin, "*1\r\n$7\r\nDISCARD\r\n", 17);
+        client_reply_str(w, c, "-EXECABORT Transaction discarded because of previous errors.\r\n");
+        tx_end(w, c);
+        return 1;
+    }
+    if (!c->pin) {
+        if (c->txq_len == 0) {
+            client_reply_str(w, c, "*0\r\n");
+            tx_end(w, c);
+            return 1;
+        }
+        if (!tx_pin(w, c, topo_first_master(w))) {
+            client_reply_error(w, c, "backend connection error");
+            tx_end(w, c);
+            return 1;
+        }
+        /* fallthrough with p = EXEC: send MULTI + queued, then EXEC below */
+    } else {
+        tx_forward(w, c, p, len);
+        tx_end(w, c);
+        return 1;
+    }
+
+send_multi_and_queue:
+    /* c->pin was just chosen: replay MULTI and the locally-answered keyless
+     * commands (their replies were already sent, so they're swallowed), then
+     * forward the current command. */
+    mux_internal_cmd(w, c->pin, "*1\r\n$5\r\nMULTI\r\n", 15);
+    for (int off = 0; off < c->txq_len;) {
+        const char *q = c->txq + off;
+        const char *cp2, *kp2;
+        int cl2, kl2, argc2;
+        long long tot2, need2;
+        if (scan_command(q, c->txq_len - off, &cp2, &cl2, &kp2, &kl2, &argc2, &tot2, &need2) != 1) break;
+        mux_internal_cmd(w, c->pin, q, (int)tot2);
+        off += (int)tot2;
+    }
+    c->txq_len = 0;
+    tx_forward(w, c, p, len);
+    if (is_exec) tx_end(w, c);
+    return 1;
+}
+
 /* Parses and dispatches as many complete commands from c->ibuf as can be
  * started right now. Stops at an incomplete command, at a legacy command
  * that has to wait for earlier fast-path replies, while a legacy command is
@@ -545,6 +1115,38 @@ void client_process_input(Worker *w, ClientConn *c) {
         int avail = c->ibuf_len - c->ibuf_off;
         if (avail <= 0) break;
         const char *p = c->ibuf + c->ibuf_off;
+        long long consume;
+
+        if (p[0] != '*') {
+            /* Inline command: one line, converted to RESP in c->conv. */
+            const char *nl = memchr(p, '\n', (size_t)avail);
+            if (!nl) {
+                if (avail > MAX_INLINE_LINE) {
+                    client_protocol_error(w, c, "Protocol error: too big inline request");
+                    break;
+                }
+                c->ibuf_need = avail + 1;
+                incomplete = 1;
+                break;
+            }
+            int linelen = (int)(nl - p);
+            consume = linelen + 1;
+            if (linelen > 0 && p[linelen - 1] == '\r') linelen--;
+            int rl = inline_to_resp(c, p, linelen);
+            if (rl < 0) {
+                client_protocol_error(w, c, "Protocol error: unbalanced quotes in request");
+                break;
+            }
+            if (rl == 0) {
+                c->ibuf_off += (int)consume;
+                continue;
+            }
+            p = c->conv;
+            avail = rl;
+        } else {
+            consume = 0;
+        }
+
         const char *cp, *kp;
         int cl, kl, argc;
         long long total, need;
@@ -566,6 +1168,7 @@ void client_process_input(Worker *w, ClientConn *c) {
             client_protocol_error(w, c, "command too large");
             break;
         }
+        if (!consume) consume = total;
 
         char cmd[64];
         int n = cl < 63 ? cl : 63;
@@ -573,9 +1176,21 @@ void client_process_input(Worker *w, ClientConn *c) {
         cmd[n] = '\0';
         const CmdInfo *ci = cmd_info(cmd);
 
-        if (ci && ci->fast && kl > 0 && !c->in_transaction && !c->in_subscribe && !c->acl_authenticated &&
-            !c->sub_conn) {
-            if (c->rq_count >= CLIENT_MAX_INFLIGHT || c->wbuf_len - c->wbuf_off >= CLIENT_MAX_PENDING_OUT) break;
+        /* WATCH/MULTI/EXEC/... and everything inside MULTI. Ordered through
+         * the request queue like the fast path, so no need to wait. */
+        if (!c->in_subscribe && !c->sub_conn && (ci || c->tx_state == 2)) {
+            int tr = tx_handle(w, c, cmd, ci, p, (int)total, kp, kl, argc);
+            if (tr == 2) break;
+            if (tr == 1) {
+                c->ibuf_off += (int)consume;
+                continue;
+            }
+        }
+
+        if (ci && ci->fast && kl > 0 && !c->in_subscribe && !c->acl_authenticated && !c->sub_conn) {
+            if (c->rq_count >= CLIENT_MAX_INFLIGHT || c->wbuf_len - c->wbuf_off >= CLIENT_MAX_PENDING_OUT ||
+                c->pin_inflight > 0)
+                break;
             c->last_interaction = w->now;
             int ln = n < (int)sizeof(c->last_cmd) - 1 ? n : (int)sizeof(c->last_cmd) - 1;
             for (int i = 0; i < ln; i++) c->last_cmd[i] = (char)tolower((unsigned char)cmd[i]);
@@ -588,22 +1203,14 @@ void client_process_input(Worker *w, ClientConn *c) {
             else if (!(m = mux_for(w, c, node_idx)))
                 client_reply_error(w, c, "backend connection error");
             else {
-                Req *r = req_new(w);
-                if (!r) {
-                    c->close_asap = 1;
-                    pw_add(w, c);
-                    break;
-                }
-                r->client = c;
-                if (c->rq_tail)
-                    c->rq_tail->cnext = r;
-                else
-                    c->rq_head = r;
-                c->rq_tail = r;
-                c->rq_count++;
+                Req *r = client_req_new(w, c);
+                if (!r) break;
+                req_keep_cmd(r, p, (int)total);
+                r->inflight_kind = 1;
+                c->shared_inflight++;
                 mux_enqueue(w, m, r, p, (int)total);
             }
-            c->ibuf_off += (int)total;
+            c->ibuf_off += (int)consume;
             continue;
         }
 
@@ -622,7 +1229,7 @@ void client_process_input(Worker *w, ClientConn *c) {
         }
         memcpy(c->hbuf, p, (size_t)total);
         c->hbuf_len = (int)total;
-        c->ibuf_off += (int)total;
+        c->ibuf_off += (int)consume;
         c->wbuf_off = c->wbuf_len = 0; /* legacy handlers write replies at wbuf[0] */
 
         char lcmd[64] = "", lkey[512] = "";

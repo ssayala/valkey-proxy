@@ -11,6 +11,16 @@
     } while (0)
 
 /* ── fanout sub-request completion ─────────────────────────────────── */
+FanoutCtx *fanout_ctx_new(int max_subs, int max_keys) {
+    size_t sz = sizeof(FanoutCtx) + (size_t)max_subs * sizeof(FanoutSub) + 2 * (size_t)max_keys * sizeof(int);
+    FanoutCtx *ctx = calloc(1, sz);
+    if (!ctx) return NULL;
+    ctx->subs = (FanoutSub *)(ctx + 1);
+    ctx->mget_sub = (int *)(ctx->subs + max_subs);
+    ctx->mget_pos = ctx->mget_sub + max_keys;
+    return ctx;
+}
+
 void fanout_ctx_free(FanoutCtx *ctx) {
     if (!ctx) return;
     for (int i = 0; i < ctx->nsubs; i++) free(ctx->subs[i].rbuf);
@@ -1214,68 +1224,7 @@ void fanout_aggregate_and_reply(Worker *w, FanoutCtx *ctx) {
 }
 
 static void fanout_dispatch_sub(Worker *w, FanoutCtx *ctx, int sub_idx, const char *cmdbuf, int cmdlen) {
-    FanoutSub *sub = &ctx->subs[sub_idx];
-    DbGroup *grp = db_group_get(w, ctx->client->db);
-    if (!grp) {
-        sub->error = 1;
-        sub->done = 1;
-        ctx->had_error = 1;
-        ctx->ndone++;
-        return;
-    }
-    ConnPool *pool = &grp->node_pools[sub->node_idx].pools[POOL_NORMAL];
-    PoolConn *conn = pool_acquire_nb(w, pool);
-    if (!conn) {
-        sub->error = 1;
-        sub->done = 1;
-        ctx->had_error = 1;
-        ctx->ndone++;
-        return;
-    }
-    conn->waiting_client = NULL;
-    conn->fanout_sub = sub;
-    sub->conn = conn;
-    if (conn->fd >= 0 && conn->fd < g_config.max_connection) w->backend_map[conn->fd] = conn;
-
-    if (resp3_conn_needs_upgrade(conn)) {
-        /* No client-side hbuf/pbuf to fall back on here (unlike the
-         * resume_client_after_conn() hook) -- stash the real command and
-         * start the handshake; handle_resp3_handshake_readable() flushes it
-         * once the connection has upgraded. conn->fanout_sub is already set
-         * above, but handle_backend_readable() checks resp3_handshake first,
-         * so the handshake's own reply can't be misrouted to
-         * handle_fanout_sub_readable(). */
-        if (resp3_defer_append(conn, cmdbuf, cmdlen) < 0 || resp3_start_conn_upgrade(w, conn) < 0) {
-            conn->fanout_sub = NULL;
-            pool_destroy_conn(w, conn);
-            sub->conn = NULL;
-            sub->error = 1;
-            sub->done = 1;
-            ctx->had_error = 1;
-            ctx->ndone++;
-        }
-        return;
-    }
-
-    if (conn->wbuf_cap < cmdlen) {
-        char *tmp = realloc(conn->wbuf, (size_t)cmdlen);
-        if (!tmp) {
-            conn->fanout_sub = NULL;
-            pool_release(w, conn);
-            sub->conn = NULL;
-            sub->error = 1;
-            sub->done = 1;
-            ctx->had_error = 1;
-            ctx->ndone++;
-            return;
-        }
-        conn->wbuf = tmp;
-        conn->wbuf_cap = cmdlen;
-    }
-    memcpy(conn->wbuf, cmdbuf, (size_t)cmdlen);
-    conn->wbuf_len = cmdlen;
-    conn->wbuf_off = 0;
-    fd_watch(w, conn->fd, EL_WRITABLE);
+    fanout_send_sub(w, &ctx->subs[sub_idx], cmdbuf, cmdlen);
 }
 
 static void fanout_route_single(Worker *w, ClientConn *client, int node_idx) {
@@ -1300,16 +1249,56 @@ static void fanout_route_single(Worker *w, ClientConn *client, int node_idx) {
     resume_client_after_conn(w, client, conn);
 }
 
-void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
+/* Per-command scratch arrays for handle_fanout_cmd(), sized from the
+ * command's own argument count instead of fixed MAX_FANOUT_KEYS stack arrays
+ * (which used to silently drop every key past the 256th). */
+typedef struct {
+    int cap; /* argument capacity of ap/al/sa/sl; also >= key count */
+    const char **ap, **sa;
+    int *al, *sl;
+    int *key_node, *sub_for_key, *sub_slot_val, *sub_node_val, *pos_counter;
+    int *slot_sub; /* CLUSTER_SLOTS entries, only for larger key counts */
+} FanoutScratch;
+
+/* Groups keys (ap[i*stride]) into one sub-request per distinct slot. Fills
+ * sc->sub_for_key / sub_slot_val / sub_node_val; returns the sub count. */
+static int group_keys_by_slot(FanoutScratch *sc, const char **ap, const int *al, int nkeys, int stride,
+                              const int *key_node) {
+    int nsubs = 0;
+    if (sc->slot_sub) memset(sc->slot_sub, -1, CLUSTER_SLOTS * sizeof(int));
+    for (int i = 0; i < nkeys; i++) {
+        int slt = key_slot(ap[i * stride], al[i * stride]);
+        int found = -1;
+        if (sc->slot_sub) {
+            found = sc->slot_sub[slt];
+        } else {
+            for (int s = 0; s < nsubs; s++)
+                if (sc->sub_slot_val[s] == slt) {
+                    found = s;
+                    break;
+                }
+        }
+        if (found < 0) {
+            sc->sub_slot_val[nsubs] = slt;
+            sc->sub_node_val[nsubs] = key_node[i];
+            if (sc->slot_sub) sc->slot_sub[slt] = nsubs;
+            found = nsubs++;
+        }
+        sc->sub_for_key[i] = found;
+    }
+    return nsubs;
+}
+
+static void handle_fanout_cmd_impl(Worker *w, ClientConn *client, const char *cmd, FanoutScratch *sc) {
     int is_mset = (!strcmp(cmd, "MSET") || !strcmp(cmd, "MSETNX"));
     int is_msetex = !strcmp(cmd, "MSETEX");
     int is_json_mset = !strcmp(cmd, "JSON.MSET");
     int is_json_mget = !strcmp(cmd, "JSON.MGET");
     int is_lcs = !strcmp(cmd, "LCS");
 
-    const char *ap[MAX_FANOUT_KEYS * 3 + 4];
-    int al[MAX_FANOUT_KEYS * 3 + 4];
-    int nargs = resp_extract_all_args(client->pbuf, client->pbuf_len, ap, al, MAX_FANOUT_KEYS * 3 + 4);
+    const char **ap = sc->ap;
+    int *al = sc->al;
+    int nargs = resp_extract_all_args(client->pbuf, client->pbuf_len, ap, al, sc->cap);
     if (nargs < 0) {
         client_send_error(w, client, "protocol error");
         FANOUT_RESET_CLIENT(client);
@@ -1332,9 +1321,7 @@ void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
         FANOUT_RESET_CLIENT(client);
         return;
     }
-    if (nkeys > MAX_FANOUT_KEYS) nkeys = MAX_FANOUT_KEYS;
-
-    int key_node[MAX_FANOUT_KEYS];
+    int *key_node = sc->key_node;
     for (int i = 0; i < nkeys; i++) {
         int ki = is_mset ? i * 2 : (is_msetex || is_json_mset) ? i * 3 : i;
         int slot = key_slot(ap[ki], al[ki]);
@@ -1378,7 +1365,7 @@ void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
             FANOUT_RESET_CLIENT(client);
             return;
         }
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -1419,8 +1406,7 @@ void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
     }
 
     if (is_msetex) {
-        if (nkeys > MAX_FANOUT_SUBS) nkeys = MAX_FANOUT_SUBS;
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(nkeys, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -1464,34 +1450,11 @@ void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
 
     if (is_mset || is_json_mset) {
         int stride = is_mset ? 2 : 3;
-        int sub_for_key[MAX_FANOUT_KEYS];
-        int sub_slot_val[MAX_FANOUT_SUBS];
-        int sub_node_val[MAX_FANOUT_SUBS];
-        int nsubs = 0;
+        int *sub_for_key = sc->sub_for_key;
+        int *sub_node_val = sc->sub_node_val;
+        int nsubs = group_keys_by_slot(sc, ap, al, nkeys, stride, key_node);
 
-        for (int i = 0; i < nkeys; i++) {
-            int ki = i * stride;
-            int slt = key_slot(ap[ki], al[ki]);
-            int found = -1;
-            for (int s = 0; s < nsubs; s++)
-                if (sub_slot_val[s] == slt) {
-                    found = s;
-                    break;
-                }
-            if (found < 0) {
-                if (nsubs >= MAX_FANOUT_SUBS) {
-                    client_send_error(w, client, "too many slot groups");
-                    FANOUT_RESET_CLIENT(client);
-                    return;
-                }
-                sub_slot_val[nsubs] = slt;
-                sub_node_val[nsubs] = key_node[i];
-                found = nsubs++;
-            }
-            sub_for_key[i] = found;
-        }
-
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(nsubs, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -1516,8 +1479,8 @@ void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
         }
 
         for (int s = 0; s < nsubs; s++) {
-            const char *sa[MAX_FANOUT_KEYS * 3];
-            int sl[MAX_FANOUT_KEYS * 3];
+            const char **sa = sc->sa;
+            int *sl = sc->sl;
             int sn = 0;
             for (int i = 0; i < nkeys; i++) {
                 if (sub_for_key[i] != s) continue;
@@ -1545,33 +1508,11 @@ void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
         return;
     }
 
-    int sub_for_key[MAX_FANOUT_KEYS];
-    int sub_slot_val[MAX_FANOUT_SUBS];
-    int sub_node_val[MAX_FANOUT_SUBS];
-    int nsubs = 0;
+    int *sub_for_key = sc->sub_for_key;
+    int *sub_node_val = sc->sub_node_val;
+    int nsubs = group_keys_by_slot(sc, ap, al, nkeys, 1, key_node);
 
-    for (int i = 0; i < nkeys; i++) {
-        int slt = key_slot(ap[i], al[i]);
-        int found = -1;
-        for (int s = 0; s < nsubs; s++)
-            if (sub_slot_val[s] == slt) {
-                found = s;
-                break;
-            }
-        if (found < 0) {
-            if (nsubs >= MAX_FANOUT_SUBS) {
-                client_send_error(w, client, "too many slot groups");
-                FANOUT_RESET_CLIENT(client);
-                return;
-            }
-            sub_slot_val[nsubs] = slt;
-            sub_node_val[nsubs] = key_node[i];
-            found = nsubs++;
-        }
-        sub_for_key[i] = found;
-    }
-
-    FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+    FanoutCtx *ctx = fanout_ctx_new(nsubs, nkeys);
     if (!ctx) {
         client_send_error(w, client, "out of memory");
         close_client(w, client);
@@ -1586,8 +1527,8 @@ void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
     client->fanout_ctx = ctx;
 
     {
-        int pos_counter[MAX_FANOUT_SUBS];
-        memset(pos_counter, 0, sizeof(pos_counter));
+        int *pos_counter = sc->pos_counter;
+        memset(pos_counter, 0, (size_t)nsubs * sizeof(int));
         for (int i = 0; i < nkeys; i++) {
             int si = sub_for_key[i];
             ctx->mget_sub[i] = si;
@@ -1607,8 +1548,8 @@ void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
     }
 
     for (int s = 0; s < nsubs; s++) {
-        const char *sub_args[MAX_FANOUT_KEYS];
-        int sub_arglens[MAX_FANOUT_KEYS];
+        const char **sub_args = sc->sa;
+        int *sub_arglens = sc->sl;
         int sub_nargs = 0;
         for (int i = 0; i < nkeys; i++) {
             if (sub_for_key[i] != s) continue;
@@ -1635,6 +1576,35 @@ void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
     }
 
     if (ctx->ndone == ctx->nsubs) fanout_aggregate_and_reply(w, ctx);
+}
+
+void handle_fanout_cmd(Worker *w, ClientConn *client, const char *cmd) {
+    int argc = (client->pbuf_len > 1 && client->pbuf[0] == '*') ? atoi(client->pbuf + 1) : 0;
+    if (argc < 1) argc = 1;
+    FanoutScratch sc;
+    sc.cap = argc + 4;
+    size_t n = (size_t)sc.cap;
+    int big = argc > 32;
+    size_t bytes = 2 * n * sizeof(const char *) + 7 * n * sizeof(int) + (big ? CLUSTER_SLOTS * sizeof(int) : 0);
+    char *mem = malloc(bytes);
+    if (!mem) {
+        client_send_error(w, client, "out of memory");
+        close_client(w, client);
+        return;
+    }
+    char *p = mem;
+    sc.ap = (const char **)p, p += n * sizeof(const char *);
+    sc.sa = (const char **)p, p += n * sizeof(const char *);
+    sc.al = (int *)p, p += n * sizeof(int);
+    sc.sl = (int *)p, p += n * sizeof(int);
+    sc.key_node = (int *)p, p += n * sizeof(int);
+    sc.sub_for_key = (int *)p, p += n * sizeof(int);
+    sc.sub_slot_val = (int *)p, p += n * sizeof(int);
+    sc.sub_node_val = (int *)p, p += n * sizeof(int);
+    sc.pos_counter = (int *)p, p += n * sizeof(int);
+    sc.slot_sub = big ? (int *)p : NULL;
+    handle_fanout_cmd_impl(w, client, cmd, &sc);
+    free(mem);
 }
 
 /* ── PUBSUB inspect aggregation helpers ─────────────────────────────── */
@@ -1820,40 +1790,7 @@ static void fanout_one_master(Worker *w, ClientConn *client, FanoutCtx *ctx, con
     sub->error = 0;
     sub->conn = NULL;
 
-    ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-    PoolConn *conn = pool_acquire_nb(w, pool);
-    if (!conn) {
-        sub->error = 1;
-        sub->done = 1;
-        ctx->had_error = 1;
-        ctx->ndone++;
-    } else {
-        int ok = 1;
-        if (conn->wbuf_cap < cmd_len) {
-            char *tmp = realloc(conn->wbuf, (size_t)cmd_len);
-            if (!tmp) {
-                pool_release(w, conn);
-                sub->error = 1;
-                sub->done = 1;
-                ctx->had_error = 1;
-                ctx->ndone++;
-                ok = 0;
-            } else {
-                conn->wbuf = tmp;
-                conn->wbuf_cap = cmd_len;
-            }
-        }
-        if (ok) {
-            memcpy(conn->wbuf, cmd_buf, (size_t)cmd_len);
-            conn->wbuf_len = cmd_len;
-            conn->wbuf_off = 0;
-            conn->waiting_client = NULL;
-            conn->fanout_sub = sub;
-            sub->conn = conn;
-            if (conn->fd >= 0 && conn->fd < g_config.max_connection) w->backend_map[conn->fd] = conn;
-            fd_watch(w, conn->fd, EL_WRITABLE);
-        }
-    }
+    fanout_send_sub(w, sub, cmd_buf, cmd_len);
 
     if (ctx->ndone == ctx->nsubs) fanout_aggregate_and_reply(w, ctx);
 }
@@ -1890,37 +1827,7 @@ static void fanout_all_masters(Worker *w, ClientConn *client, FanoutCtx *ctx, co
         sub->error = 0;
         sub->conn = NULL;
 
-        ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
-        if (!conn) {
-            sub->error = 1;
-            sub->done = 1;
-            ctx->had_error = 1;
-            ctx->ndone++;
-            continue;
-        }
-
-        if (conn->wbuf_cap < cmd_len) {
-            char *tmp = realloc(conn->wbuf, (size_t)cmd_len);
-            if (!tmp) {
-                pool_release(w, conn);
-                sub->error = 1;
-                sub->done = 1;
-                ctx->had_error = 1;
-                ctx->ndone++;
-                continue;
-            }
-            conn->wbuf = tmp;
-            conn->wbuf_cap = cmd_len;
-        }
-        memcpy(conn->wbuf, cmd_buf, (size_t)cmd_len);
-        conn->wbuf_len = cmd_len;
-        conn->wbuf_off = 0;
-        conn->waiting_client = NULL;
-        conn->fanout_sub = sub;
-        sub->conn = conn;
-        if (conn->fd >= 0 && conn->fd < g_config.max_connection) w->backend_map[conn->fd] = conn;
-        fd_watch(w, conn->fd, EL_WRITABLE);
+        fanout_send_sub(w, sub, cmd_buf, cmd_len);
     }
 
     if (ctx->ndone == ctx->nsubs) fanout_aggregate_and_reply(w, ctx);
@@ -1990,7 +1897,7 @@ void handle_pubsub_inspect_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -2018,7 +1925,7 @@ void handle_pubsub_inspect_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -2088,7 +1995,7 @@ void handle_pubsub_inspect_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -2158,7 +2065,7 @@ void handle_slowlog_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -2192,7 +2099,7 @@ void handle_slowlog_cmd(Worker *w, ClientConn *client, int cmdlen) {
             if (end == tmp || *end || count < -1) count = -1;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -2219,7 +2126,7 @@ void handle_slowlog_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -2281,7 +2188,7 @@ void handle_commandlog_cmd(Worker *w, ClientConn *client, int cmdlen) {
      * nodes, sum the per-node counts. The type argument is forwarded verbatim
      * from the client's original request; the backend validates it. */
     if (!strcmp(subcmd, "LEN")) {
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -2314,7 +2221,7 @@ void handle_commandlog_cmd(Worker *w, ClientConn *client, int cmdlen) {
             if (end == tmp || *end || count < -1) count = -1;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -2332,7 +2239,7 @@ void handle_commandlog_cmd(Worker *w, ClientConn *client, int cmdlen) {
     /* COMMANDLOG RESET <slow|large-request|large-reply> — fan-out to all
      * master nodes, reply +OK if all succeed. */
     if (!strcmp(subcmd, "RESET")) {
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -2756,7 +2663,7 @@ void handle_script_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -2786,7 +2693,7 @@ void handle_script_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -2823,7 +2730,7 @@ void handle_script_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -2935,7 +2842,7 @@ void handle_function_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -2965,7 +2872,7 @@ void handle_function_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -3002,7 +2909,7 @@ void handle_function_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -3032,7 +2939,7 @@ void handle_function_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -3090,7 +2997,7 @@ void handle_function_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -3140,7 +3047,7 @@ void handle_command_cmd(Worker *w, ClientConn *client, int cmdlen) {
     /* Bare COMMAND (no subcommand) has the same reply shape as COMMAND INFO
      * with no arguments, so it reuses that path verbatim. */
     if (!resp_get_nth_arg(client->hbuf, client->hbuf_len, 1, &sub, &sublen)) {
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -3191,7 +3098,7 @@ void handle_command_cmd(Worker *w, ClientConn *client, int cmdlen) {
         int tmplen;
         int has_args = resp_get_nth_arg(client->hbuf, client->hbuf_len, 2, &tmp, &tmplen);
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -3209,7 +3116,7 @@ void handle_command_cmd(Worker *w, ClientConn *client, int cmdlen) {
      * the reply is post-processed so it only reflects what this proxy
      * itself supports (see fanout_agg_command_docs). */
     if (!strcmp(subcmd, "DOCS")) {
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -3227,7 +3134,7 @@ void handle_command_cmd(Worker *w, ClientConn *client, int cmdlen) {
      * the reply is post-processed so it only lists commands this proxy
      * itself supports (see fanout_agg_command_list). */
     if (!strcmp(subcmd, "LIST")) {
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             client_send_error(w, client, "out of memory");
             close_client(w, client);
@@ -3256,7 +3163,7 @@ void handle_command_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
 
-        FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+        FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
         if (!ctx) {
             free(built);
             client_send_error(w, client, "out of memory");
@@ -3521,7 +3428,7 @@ void handle_nokey_cmd(Worker *w, ClientConn *client, const char *cmd, int cmdlen
     int target_nodes[MAX_NODES];
     int ntargets = topo_all_masters(w, target_nodes);
 
-    FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+    FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
     if (!ctx) {
         client_send_error(w, client, "out of memory");
         close_client(w, client);
@@ -3555,37 +3462,7 @@ void handle_nokey_cmd(Worker *w, ClientConn *client, const char *cmd, int cmdlen
         sub->error = 0;
         sub->conn = NULL;
 
-        ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
-        if (!conn) {
-            sub->error = 1;
-            sub->done = 1;
-            ctx->had_error = 1;
-            ctx->ndone++;
-            continue;
-        }
-
-        if (conn->wbuf_cap < cmdlen) {
-            char *tmp = realloc(conn->wbuf, (size_t)cmdlen);
-            if (!tmp) {
-                pool_release(w, conn);
-                sub->error = 1;
-                sub->done = 1;
-                ctx->had_error = 1;
-                ctx->ndone++;
-                continue;
-            }
-            conn->wbuf = tmp;
-            conn->wbuf_cap = cmdlen;
-        }
-        memcpy(conn->wbuf, client->hbuf, (size_t)cmdlen);
-        conn->wbuf_len = cmdlen;
-        conn->wbuf_off = 0;
-        conn->waiting_client = NULL;
-        conn->fanout_sub = sub;
-        sub->conn = conn;
-        if (conn->fd >= 0 && conn->fd < g_config.max_connection) w->backend_map[conn->fd] = conn;
-        fd_watch(w, conn->fd, EL_WRITABLE);
+        fanout_send_sub(w, sub, client->hbuf, cmdlen);
     }
 
     if (ctx->ndone == ctx->nsubs) fanout_aggregate_and_reply(w, ctx);
@@ -3640,7 +3517,7 @@ void handle_scan_cmd(Worker *w, ClientConn *client, int cmdlen) {
         return;
     }
 
-    FanoutCtx *ctx = calloc(1, sizeof(FanoutCtx));
+    FanoutCtx *ctx = fanout_ctx_new(MAX_NODES, 0);
     if (!ctx) {
         client_send_error(w, client, "out of memory");
         close_client(w, client);
@@ -3713,61 +3590,8 @@ void handle_scan_cmd(Worker *w, ClientConn *client, int cmdlen) {
             continue;
         }
 
-        ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
-        if (!conn) {
-            free(sub_cmd);
-            sub->error = 1;
-            sub->done = 1;
-            ctx->had_error = 1;
-            ctx->ndone++;
-            continue;
-        }
-
-        conn->waiting_client = NULL;
-        conn->fanout_sub = sub;
-        sub->conn = conn;
-        if (conn->fd >= 0 && conn->fd < g_config.max_connection) w->backend_map[conn->fd] = conn;
-
-        if (resp3_conn_needs_upgrade(conn)) {
-            /* Same reasoning as fanout_dispatch_sub() above: stash the real
-             * SCAN sub-command and let handle_resp3_handshake_readable()
-             * flush it once this connection has upgraded. */
-            int derr = resp3_defer_append(conn, sub_cmd, sub_cmdlen) < 0 || resp3_start_conn_upgrade(w, conn) < 0;
-            free(sub_cmd);
-            if (derr) {
-                conn->fanout_sub = NULL;
-                pool_destroy_conn(w, conn);
-                sub->conn = NULL;
-                sub->error = 1;
-                sub->done = 1;
-                ctx->had_error = 1;
-                ctx->ndone++;
-            }
-            continue;
-        }
-
-        if (conn->wbuf_cap < sub_cmdlen) {
-            char *tmp = realloc(conn->wbuf, (size_t)sub_cmdlen);
-            if (!tmp) {
-                free(sub_cmd);
-                conn->fanout_sub = NULL;
-                pool_release(w, conn);
-                sub->conn = NULL;
-                sub->error = 1;
-                sub->done = 1;
-                ctx->had_error = 1;
-                ctx->ndone++;
-                continue;
-            }
-            conn->wbuf = tmp;
-            conn->wbuf_cap = sub_cmdlen;
-        }
-        memcpy(conn->wbuf, sub_cmd, (size_t)sub_cmdlen);
-        conn->wbuf_len = sub_cmdlen;
-        conn->wbuf_off = 0;
+        fanout_send_sub(w, sub, sub_cmd, sub_cmdlen);
         free(sub_cmd);
-        fd_watch(w, conn->fd, EL_WRITABLE);
     }
 
     if (ctx->ndone == ctx->nsubs) fanout_aggregate_and_reply(w, ctx);

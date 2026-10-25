@@ -160,12 +160,20 @@ struct ConnPool {
  * needed to route each one back to its client. */
 struct Req {
     ClientConn *client; /* NULL = internal (SELECT/HELLO) or client already closed */
+    FanoutSub *sub;     /* fan-out sub-request: reply goes to sub->rbuf instead */
     Req *cnext;         /* next in client's reply-order queue */
     Req *mnext;         /* next in mux in-flight FIFO (or worker freelist) */
     int done;           /* reply arrived (held in reply[]) before earlier ones */
     int internal;
+    int inflight_kind;  /* 1 = counted in client->shared_inflight, 2 = pin_inflight */
     char *reply;
     int reply_len;
+    /* Copy of the command, kept so a MOVED/ASK reply can be retried on the
+     * right node (see mux_try_redirect()). Small commands live inline. */
+    char *cmd;
+    int cmd_len;
+    int redirects;
+    char cmd_inl[128];
 };
 
 struct MuxConn {
@@ -182,6 +190,12 @@ struct MuxConn {
     int inflight;
     MuxConn *pf_prev, *pf_next; /* worker's pending-flush list */
     int in_pf;
+    /* Private connection pinned to one client for WATCH/MULTI (see tx_*()
+     * in mux.c); NULL for the shared per-node muxes. */
+    ClientConn *pin_client;
+    int reusable;      /* back to owner->tx_idle once drained */
+    int gen;           /* owner->gen at connect; stale once the node moves on */
+    MuxConn *idle_next;
 };
 
 /* gen mirrors the owning Worker's topo.node_gen[node_idx] as of the last time
@@ -192,6 +206,7 @@ typedef struct NodePools {
     int gen;
     ConnPool pools[POOL_TYPE_COUNT];
     MuxConn *mux[2]; /* [0] = RESP2, [1] = RESP3; created lazily */
+    MuxConn *tx_idle[2]; /* idle transaction connections, by RESP version */
 } NodePools;
 typedef struct {
     int db;
@@ -218,6 +233,19 @@ struct ClientConn {
     int in_pw;
     ClientConn *bl_prev, *bl_next; /* worker's input-backlog list */
     int in_bl;
+    /* ── transactions (see tx_*() in mux.c) ── */
+    int tx_state; /* 0 = none, 1 = WATCH active, 2 = inside MULTI */
+    int tx_dirty; /* a command was rejected locally inside MULTI -> EXECABORT */
+    MuxConn *pin; /* private backend connection for WATCH/MULTI, once known */
+    /* Requests still awaiting a backend reply, by connection kind. Separate
+     * connections don't order against each other, so a command only goes to
+     * the pinned connection once nothing is in flight on shared ones, and
+     * vice versa (e.g. SET k; MULTI; INCR k must not run the INCR first). */
+    int shared_inflight, pin_inflight;
+    char *txq;    /* keyless commands queued after MULTI, before pinning */
+    int txq_len, txq_cap;
+    char *conv; /* inline command converted to RESP */
+    int conv_cap;
     int fast_db; /* db fast_np was looked up for */
     NodePools *fast_np;
     /* Exactly one complete command, handed to the legacy (non-fast-path)
@@ -286,6 +314,7 @@ struct FanoutSub {
     int sub_idx;
     int node_idx;
     PoolConn *conn;
+    Req *req; /* in flight on a mux (see fanout_send_sub()) */
     char *rbuf;
     int rbuf_len, rbuf_cap;
     int done, error;
@@ -295,10 +324,11 @@ struct FanoutCtx {
     ClientConn *client;
     char cmd[16];
     int nsubs, ndone, had_error;
-    FanoutSub subs[MAX_FANOUT_SUBS];
+    /* Sized per command by fanout_ctx_new() (same allocation as the ctx). */
+    FanoutSub *subs;
     int total_keys;
-    int mget_sub[MAX_FANOUT_KEYS];
-    int mget_pos[MAX_FANOUT_KEYS];
+    int *mget_sub;
+    int *mget_pos;
     uint64_t scan_node_cursors[MAX_NODES];
     int scan_ntargets;
     int scan_target_nodes[MAX_NODES];
@@ -461,6 +491,9 @@ int init_tls(void);
 void fetch_cluster_nodes(void);
 int key_slot(const char *key, int klen);
 void topology_start_refresh_thread(void);
+/* Ask the refresh thread for an immediate CLUSTER NODES refresh (e.g. after a
+ * MOVED reply). Cheap and rate-limited; callable from any thread. */
+void topology_request_refresh(void);
 static inline int topology_version_load(void) {
     return atomic_load_explicit(&g_topology_version, memory_order_acquire);
 }
@@ -566,8 +599,15 @@ void legacy_dispatch(Worker *w, ClientConn *client, char *cmd, int cmdlen, char 
 
 /* ── pipelined fast path (src/mux.c) ───────────────────────────────── */
 void client_process_input(Worker *w, ClientConn *client);
+/* Sends one fan-out sub-request over the worker's shared RESP2 connection to
+ * sub->node_idx; the reply lands in sub->rbuf and completes the sub exactly
+ * like the pooled-connection path did. If it can't even be queued, the sub
+ * is marked done+error (ndone++) but NOT aggregated -- the caller checks
+ * ndone == nsubs after dispatching every sub, as before. */
+void fanout_send_sub(Worker *w, FanoutSub *sub, const char *cmd, int len);
 int client_flush(Worker *w, ClientConn *client);
 void client_detach_requests(Worker *w, ClientConn *client);
+void client_release_tx(Worker *w, ClientConn *client);
 void client_list_unlink(Worker *w, ClientConn *client);
 void handle_mux_readable(Worker *w, MuxConn *m);
 void handle_mux_writable(Worker *w, MuxConn *m);
@@ -584,6 +624,8 @@ void handle_client_readable(Worker *w, ClientConn *client);
 /* ── fan-out handlers ───────────────────────────────────────────────── */
 int topo_first_master(Worker *w);
 int topo_all_masters(Worker *w, int *out);
+/* Zeroed ctx with room for max_subs subs and max_keys MGET key positions. */
+FanoutCtx *fanout_ctx_new(int max_subs, int max_keys);
 void fanout_ctx_free(FanoutCtx *ctx);
 void handle_fanout_sub_readable(Worker *w, PoolConn *conn);
 void fanout_aggregate_and_reply(Worker *w, FanoutCtx *ctx);

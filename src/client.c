@@ -20,6 +20,7 @@ void close_client(Worker *w, ClientConn *client) {
     w->close_seq++;
     client_list_unlink(w, client);
     client_detach_requests(w, client);
+    client_release_tx(w, client);
     fd_unwatch(w, fd, EL_READABLE | EL_WRITABLE);
     if (fd >= 0 && fd < g_config.max_connection) w->client_map[fd] = NULL;
     if (client->state == CS_WAITING_CONN && client->waiting_pool) {
@@ -50,6 +51,11 @@ void close_client(Worker *w, ClientConn *client) {
         FanoutCtx *ctx = client->fanout_ctx;
         for (int i = 0; i < ctx->nsubs; i++) {
             FanoutSub *sub = &ctx->subs[i];
+            if (sub->req) {
+                /* In flight on a shared mux: orphan it (freed on reply). */
+                sub->req->sub = NULL;
+                sub->req = NULL;
+            }
             if (sub->conn) {
                 sub->conn->fanout_sub = NULL;
                 pool_destroy_conn(w, sub->conn);

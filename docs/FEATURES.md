@@ -4,7 +4,7 @@
 
 | Handling | Description |
 |---|---|
-| **Single-key routing** | Compute `CRC16(key)` to find the slot, forward to that node, streaming the raw bytes through unparsed |
+| **Single-key routing** | Compute `CRC16(key)` to find the slot and pipeline the command onto the worker's shared connection to that node (one per node/db/RESP version); replies are matched in order and returned in each client's command order. `MOVED`/`ASK` replies are retried on the right node (up to 5 times) and `MOVED` triggers an immediate topology refresh |
 | **Multi-key (same-slot check)** | Extract every key in the command; if they don't all hash to the same slot, return `-CROSSSLOT` immediately, otherwise forward like a single-key command |
 | **Multi-key fan-out** | Split the command per key into several sub-commands sent to their respective nodes, then merge the replies |
 | **No-key broadcast** | Broadcast to every primary node and merge the replies |
@@ -26,6 +26,20 @@ merged into one reply (`FANOUT_CMDS` in `src/fanout.c`):
 
 > `MSETNX` is **not** a fan-out command — it's a multi-key, same-slot command (all keys must
 > share a slot, otherwise `-CROSSSLOT`).
+
+Fan-out commands accept any number of keys (bounded only by `max_command_size`); sub-commands
+travel over the same shared pipelined connections as single-key commands.
+
+## 2a. Transactions (`MULTI` / `EXEC` / `DISCARD` / `WATCH` / `UNWATCH`)
+
+`WATCH` or the first keyed command after `MULTI` pins the client to a private backend connection
+on the owning node; the rest of the transaction runs there and the backend enforces the usual
+rules (all keys must share a slot, otherwise `EXEC` fails with `-CROSSSLOT`; watched-key
+invalidation; `EXECABORT`). `MULTI` itself is answered locally, and keyless commands queued before
+the first key (`PING`, `ECHO`, ...) are answered `+QUEUED` locally and replayed on the pinned
+connection. A keyless-only transaction runs on the first master. Pub/Sub, `AUTH`, `HELLO`,
+`SELECT`, `CLIENT`, `ACL` and `MODULE` are rejected inside `MULTI` (and make `EXEC` return
+`EXECABORT`). Pinned connections are reused after `EXEC`/`DISCARD`/`UNWATCH`.
 
 ## 3. No-key broadcast / single-node forward command details
 
@@ -99,7 +113,9 @@ directly affect command behavior are listed here:
 | `min_normal_connection` / `max_normal_connection` | 2 / 20 | Pool used by the vast majority of read/write commands |
 | `min_blocking_connection` / `max_blocking_connection` | 2 / 10 | `BLPOP` and other blocking commands |
 | `min_subscription_connection` / `max_subscription_connection` | 0 / 10 | Pub/Sub |
-| `min_transaction_connection` / `max_transaction_connection` | 0 / 10 | Capacity settings exist for the transaction pool |
+| `min_transaction_connection` / `max_transaction_connection` | 0 / 10 | Unused: transactions use pinned connections (see 2a) |
 | `min_acl_connection` / `max_acl_connection` | 0 / 10 | `ACL`/`AUTH`, plus each authenticated client's dedicated per-node connections |
-| `cluster_refresh_interval_ms` | 0 (disabled) | Whether/how often the cluster topology is refreshed in the background |
+| `cluster_refresh_interval_ms` | 0 (on `MOVED` only) | How often the cluster topology is refreshed in the background; a `MOVED` reply always triggers an immediate refresh |
+| `max_command_size` | 512MB | Largest single client command accepted |
+| `verbose` | no | Per-command / per-connection trace logging |
 | `max_connection` | 4000 | Per-worker-thread fd budget (client sockets + backend connections + listener fd(s)) |
