@@ -498,6 +498,7 @@ extern atomic_int g_topology_version;
 extern atomic_int g_backend_resp3_active;
 extern atomic_llong g_next_client_id;
 extern atomic_int g_shutdown; /* set by main on SIGTERM/SIGINT */
+extern atomic_int g_stop;     /* set by main once draining is over: threads exit */
 extern pthread_rwlock_t g_topology_lock;
 extern Worker g_workers[MAX_WORKERS];
 extern int g_tcp_fd, g_unix_fd;
@@ -587,6 +588,10 @@ void topology_start_refresh_thread(void);
 /* Ask the refresh thread for an immediate CLUSTER NODES refresh (e.g. after a
  * MOVED reply). Cheap and rate-limited; callable from any thread. */
 void topology_request_refresh(void);
+/* Shutdown: stop and join the refresh thread / connector threads (pool.c),
+ * so nothing is still using OpenSSL when exit() runs its cleanup. */
+void topology_stop_refresh_thread(void);
+void connector_stop(void);
 static inline int topology_version_load(void) {
     return atomic_load_explicit(&g_topology_version, memory_order_acquire);
 }

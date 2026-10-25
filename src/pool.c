@@ -139,12 +139,18 @@ static pthread_mutex_t cj_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cj_cv = PTHREAD_COND_INITIALIZER;
 static ConnectJob *cj_head, *cj_tail;
 static pthread_once_t cj_once = PTHREAD_ONCE_INIT;
+static pthread_t cj_tids[CONNECTOR_THREADS];
+static int cj_nstarted = 0, cj_stopping = 0;
 
 static void *connector_loop(void *arg) {
     (void)arg;
     for (;;) {
         pthread_mutex_lock(&cj_mu);
-        while (!cj_head) pthread_cond_wait(&cj_cv, &cj_mu);
+        while (!cj_head && !cj_stopping) pthread_cond_wait(&cj_cv, &cj_mu);
+        if (cj_stopping) {
+            pthread_mutex_unlock(&cj_mu);
+            break;
+        }
         ConnectJob *j = cj_head;
         cj_head = j->next;
         if (!cj_head) cj_tail = NULL;
@@ -171,10 +177,19 @@ static void *connector_loop(void *arg) {
 }
 
 static void connector_start(void) {
-    for (int i = 0; i < CONNECTOR_THREADS; i++) {
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, connector_loop, NULL) == 0) pthread_detach(tid);
-    }
+    for (int i = 0; i < CONNECTOR_THREADS; i++)
+        if (pthread_create(&cj_tids[cj_nstarted], NULL, connector_loop, NULL) == 0) cj_nstarted++;
+}
+
+/* Called by main() after every worker has been joined (so no new jobs, and
+ * cj_nstarted -- set under pthread_once by a worker -- is visible). */
+void connector_stop(void) {
+    pthread_mutex_lock(&cj_mu);
+    cj_stopping = 1;
+    pthread_cond_broadcast(&cj_cv);
+    pthread_mutex_unlock(&cj_mu);
+    for (int i = 0; i < cj_nstarted; i++) pthread_join(cj_tids[i], NULL);
+    cj_nstarted = 0;
 }
 
 /* Queues one background connect for pool p if it has room. */

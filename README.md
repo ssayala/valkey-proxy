@@ -11,6 +11,8 @@ Requires GCC and (optionally) OpenSSL for TLS support. Supported on Linux, macOS
 ```bash
 make            # build → produces ./valkey-proxy
 make NO_TLS=1   # build without TLS support
+make SANITIZE=address,undefined   # testing: ASan + UBSan build (make clean first)
+make SANITIZE=thread              # testing: ThreadSanitizer build
 make clean      # remove binary
 ```
 

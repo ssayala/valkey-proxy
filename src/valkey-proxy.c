@@ -22,6 +22,7 @@ atomic_int g_topology_version = 0;
 atomic_int g_backend_resp3_active = 0;
 atomic_llong g_next_client_id = 0;
 atomic_int g_shutdown = 0;
+atomic_int g_stop = 0;
 pthread_rwlock_t g_topology_lock = PTHREAD_RWLOCK_INITIALIZER;
 Worker g_workers[MAX_WORKERS];
 int g_tcp_fd = -1, g_unix_fd = -1;
@@ -250,17 +251,7 @@ static void *worker_thread(void *arg) {
      * out of el_poll(-1) the moment it publishes a change, instead of this
      * worker only noticing on its next unrelated client/backend event (see
      * wake_all_workers() in cluster.c). */
-    int wakefds[2];
-    if (pipe(wakefds) == 0) {
-        set_nonblocking(wakefds[0]);
-        set_nonblocking(wakefds[1]);
-        w->wake_r = wakefds[0];
-        w->wake_w = wakefds[1];
-        fd_watch(w, w->wake_r, EL_READABLE);
-    } else {
-        perror("pipe(wake)");
-        w->wake_r = w->wake_w = -1;
-    }
+    if (w->wake_r >= 0) fd_watch(w, w->wake_r, EL_READABLE); /* pipe created by main() */
 
     /* Seed this worker's topology snapshot from the global state before the
      * first db_group_create() reads it (fetch_cluster_nodes() has already
@@ -284,7 +275,7 @@ static void *worker_thread(void *arg) {
     db_group_get(w, g_config.db);
 
     w->last_sweep = time(NULL);
-    while (1) {
+    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
         int n = el_poll(w->el, worker_has_ready_backlog(w) ? 0 : worker_sweep_interval_ms());
         if (n < 0) break;
         w->now = time(NULL);
@@ -348,14 +339,27 @@ int main(int argc, char **argv) {
      * wake_w isn't ready until its own worker_thread() runs, which happens
      * after this point, so -1 here is what tells wake_all_workers() to skip
      * a worker that isn't listening yet instead of writing to fd 0. */
-    for (int i = 0; i < MAX_WORKERS; i++) g_workers[i].wake_w = -1;
-
-    fetch_cluster_nodes();
-    topology_start_refresh_thread();
+    for (int i = 0; i < MAX_WORKERS; i++) g_workers[i].wake_r = g_workers[i].wake_w = -1;
 
     int nw = g_config.worker_thread_no;
     if (nw < 1) nw = 1;
     if (nw > MAX_WORKERS) nw = MAX_WORKERS;
+    /* Each worker's wake pipe exists before any thread that writes to it
+     * (refresh thread, connector threads, main at shutdown) can start. */
+    for (int i = 0; i < nw; i++) {
+        int wakefds[2];
+        if (pipe(wakefds) != 0) {
+            perror("pipe(wake)");
+            exit(1);
+        }
+        set_nonblocking(wakefds[0]);
+        set_nonblocking(wakefds[1]);
+        g_workers[i].wake_r = wakefds[0];
+        g_workers[i].wake_w = wakefds[1];
+    }
+
+    fetch_cluster_nodes();
+    topology_start_refresh_thread();
 
     /* Linux: one SO_REUSEPORT listener per worker, all bound before any
      * worker starts accepting, so the kernel spreads new connections evenly
@@ -423,6 +427,16 @@ int main(int argc, char **argv) {
             break;
         }
     }
+    /* Stop every thread before returning: exit() runs OpenSSL's cleanup,
+     * which must not race a thread still inside OpenSSL. */
+    atomic_store(&g_stop, 1);
+    for (int i = 0; i < nw; i++) {
+        char b = 'x';
+        if (write(g_workers[i].wake_w, &b, 1) < 0) {}
+    }
+    for (int i = 0; i < nw; i++) pthread_join(g_workers[i].tid, NULL);
+    topology_stop_refresh_thread();
+    connector_stop();
     if (g_config.unix_socket_path[0]) unlink(g_config.unix_socket_path);
     printf("Bye.\n");
     return 0;

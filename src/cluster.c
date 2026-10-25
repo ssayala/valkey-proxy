@@ -462,6 +462,8 @@ static pthread_mutex_t refresh_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t refresh_cv;
 static int refresh_requested = 0;
 static atomic_llong refresh_last_request_ms = 0;
+static pthread_t refresh_tid;
+static int refresh_started = 0;
 
 #define REFRESH_MIN_GAP_MS 100 /* collapse bursts of MOVED replies into one refresh */
 
@@ -469,6 +471,16 @@ static long long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+void topology_stop_refresh_thread(void) {
+    if (!refresh_started) return;
+    pthread_mutex_lock(&refresh_mu);
+    refresh_requested = 1; /* wake it; it sees g_stop and exits */
+    pthread_cond_signal(&refresh_cv);
+    pthread_mutex_unlock(&refresh_mu);
+    pthread_join(refresh_tid, NULL);
+    refresh_started = 0;
 }
 
 void topology_request_refresh(void) {
@@ -503,6 +515,7 @@ static void *topology_refresh_loop(void *arg) {
         }
         refresh_requested = 0;
         pthread_mutex_unlock(&refresh_mu);
+        if (atomic_load(&g_stop)) break;
 
         ClusterNode dn[MAX_NODES];
         int dcount = 0, dslot[CLUSTER_SLOTS];
@@ -553,12 +566,11 @@ void topology_start_refresh_thread(void) {
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
     pthread_cond_init(&refresh_cv, &ca);
     pthread_condattr_destroy(&ca);
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, topology_refresh_loop, NULL) != 0) {
+    if (pthread_create(&refresh_tid, NULL, topology_refresh_loop, NULL) != 0) {
         perror("pthread_create(topology_refresh_loop)");
         return;
     }
-    pthread_detach(tid);
+    refresh_started = 1;
     if (g_config.cluster_refresh_interval_ms > 0)
         printf("Cluster topology refresh: every %dms (fail-grace=%dms)\n\n", g_config.cluster_refresh_interval_ms,
                g_config.cluster_node_fail_grace_ms);
