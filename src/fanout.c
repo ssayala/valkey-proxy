@@ -804,10 +804,10 @@ static char *fanout_agg_function_stats(Worker *w, FanoutCtx *ctx, int *out_len) 
         if (!rs || !en) continue;
 
         const ClusterNode *nd = &w->topo.nodes[s->node_idx];
-        char ipport[96];
+        char ipport[300]; /* ip is up to 255 chars (hostname) + ":port" */
         int ipport_len = snprintf(ipport, sizeof(ipport), "%s:%d", nd->ip, nd->port);
 
-        char hdr[196];
+        char hdr[400];
         int hdr_len = snprintf(hdr, sizeof(hdr), "%s\r\n$7\r\nnode-ip\r\n$%d\r\n%s\r\n$14\r\nrunning_script\r\n",
                                resp3 ? "%3" : "*6", ipport_len, ipport);
         static const char *engines_hdr = "$7\r\nengines\r\n";

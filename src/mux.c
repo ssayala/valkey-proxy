@@ -425,12 +425,8 @@ static void mux_internal_cmd(Worker *w, MuxConn *m, const char *cmd, int len) {
 
 static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
     const ClusterNode *nd = &w->topo.nodes[np->node_idx];
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port = htons((uint16_t)nd->port);
-    if (inet_pton(AF_INET, nd->ip, &a.sin_addr) != 1) return NULL;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (nd->salen == 0) return NULL; /* resolved off-thread by discovery; never DNS here */
+    int fd = socket(nd->sa.ss_family, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
     if (fd >= g_config.max_connection) {
         close(fd);
@@ -439,7 +435,7 @@ static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
     set_nonblocking(fd);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    int rc = connect(fd, (struct sockaddr *)&a, sizeof(a));
+    int rc = connect(fd, (const struct sockaddr *)&nd->sa, nd->salen);
     if (rc < 0 && errno != EINPROGRESS) {
         close(fd);
         return NULL;
@@ -643,12 +639,17 @@ static int mux_try_redirect(Worker *w, MuxConn *m, Req *r, const char *d, int le
     int hlen = (int)(colon - host), port = atoi(colon + 1);
 
     int idx = -1;
-    for (int i = 0; i < w->topo.node_count; i++)
-        if (w->topo.nodes[i].port == port && (int)strlen(w->topo.nodes[i].ip) == hlen &&
-            !memcmp(w->topo.nodes[i].ip, host, (size_t)hlen)) {
+    /* The redirect names the node by IP or, with cluster-preferred-endpoint-
+     * type hostname, by its announced hostname. */
+    for (int i = 0; i < w->topo.node_count; i++) {
+        const ClusterNode *nd = &w->topo.nodes[i];
+        if (nd->port != port) continue;
+        if (((int)strlen(nd->ip) == hlen && !memcmp(nd->ip, host, (size_t)hlen)) ||
+            (nd->hostname[0] && (int)strlen(nd->hostname) == hlen && !memcmp(nd->hostname, host, (size_t)hlen))) {
             idx = i;
             break;
         }
+    }
     if (idx < 0) return 0; /* unknown node: let the refresh find it, pass the error on */
     if (!ask) w->topo.slot_map[slot] = idx;
 
@@ -1926,6 +1927,7 @@ void worker_after_events(Worker *w) {
 
 /* ── timeouts ─────────────────────────────────────────────────────────── */
 int worker_sweep_interval_ms(void) {
+    if (atomic_load_explicit(&g_shutdown, memory_order_relaxed)) return 100;
     return (g_config.client_timeout > 0 || (g_config.tls_enabled && g_config.tls_handshake_timeout > 0)) ? 1000 : -1;
 }
 
@@ -1951,6 +1953,34 @@ void worker_sweep_clients(Worker *w) {
         if (c->state != CS_READING_HDR || c->rq_head || c->in_subscribe || c->sub_conn || client_out_bytes(c) > 0)
             continue;
         LOG_VERBOSE("[worker %d] closing %s: idle for %lds\n", w->thread_id, c->addr, (long)(w->now - c->last_interaction));
+        close_client(w, c);
+    }
+}
+
+void worker_drain(Worker *w) {
+    if (!w->draining) {
+        w->draining = 1;
+        /* A per-worker listener can simply be closed: new connections go
+         * elsewhere (or are refused). A shared one is only unwatched. */
+        if (w->listen_fd >= 0) {
+            fd_unwatch(w, w->listen_fd, EL_READABLE);
+            if (g_listen_per_worker) close(w->listen_fd);
+            w->listen_fd = -1;
+        }
+        if (g_unix_fd >= 0) fd_unwatch(w, g_unix_fd, EL_READABLE);
+    }
+    for (int fd = 0; fd < g_config.max_connection; fd++) {
+        ClientConn *c = w->client_map[fd];
+        if (!c || c->tls_hs) {
+            if (c) close_client(w, c);
+            continue;
+        }
+        /* Subscribers never go quiet on their own: let them reconnect
+         * elsewhere. Everyone else first gets every reply it's owed. */
+        int subscribed = c->in_subscribe || c->sub_conn;
+        if (!subscribed && (c->state != CS_READING_HDR || c->rq_head || c->tx_state || c->ibuf_len > c->ibuf_off))
+            continue;
+        if (client_out_bytes(c) > 0) continue;
         close_client(w, c);
     }
 }

@@ -19,9 +19,11 @@ int g_node_has_slots[MAX_NODES];
 atomic_int g_topology_version = 0;
 atomic_int g_backend_resp3_active = 0;
 atomic_llong g_next_client_id = 0;
+atomic_int g_shutdown = 0;
 pthread_rwlock_t g_topology_lock = PTHREAD_RWLOCK_INITIALIZER;
 Worker g_workers[MAX_WORKERS];
 int g_tcp_fd = -1, g_unix_fd = -1;
+int g_listen_per_worker = 0;
 #ifdef USE_TLS
 SSL_CTX *g_ssl_ctx = NULL;
 #endif
@@ -145,6 +147,7 @@ static void do_accept(Worker *w, int listen_fd) {
             LOG_VERBOSE("[worker %d] client connected: unix socket  fd=%d\n", w->thread_id, fd);
         }
         w->client_map[fd] = client;
+        atomic_fetch_add(&w->nclients, 1);
 #ifdef USE_IOURING
         if (w->ring && !client->ssl) {
             uring_attach_client(w, client);
@@ -286,6 +289,7 @@ static void *worker_thread(void *arg) {
         worker_dispatch_events(w, n);
         worker_after_events(w);
         worker_sweep_clients(w);
+        if (atomic_load_explicit(&g_shutdown, memory_order_relaxed)) worker_drain(w);
     }
     return NULL;
 }
@@ -302,6 +306,14 @@ int main(int argc, char **argv) {
      * makes such a write just fail with -1/EPIPE, which every write() call
      * site already handles. */
     signal(SIGPIPE, SIG_IGN);
+
+    /* SIGTERM/SIGINT are taken synchronously by main() (sigwait below), so
+     * block them before any thread exists -- every thread inherits this. */
+    sigset_t stopsigs;
+    sigemptyset(&stopsigs);
+    sigaddset(&stopsigs, SIGTERM);
+    sigaddset(&stopsigs, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &stopsigs, NULL);
 
     parse_conf(conf_path);
     cmd_info_init();
@@ -361,6 +373,7 @@ int main(int argc, char **argv) {
         }
     }
     g_tcp_fd = g_workers[0].listen_fd;
+    g_listen_per_worker = per_worker;
     printf("Listening on %s:%d (TCP%s)\n", g_config.bind_ip, g_config.proxy_port,
            per_worker && nw > 1 ? ", one SO_REUSEPORT socket per worker" : "");
 
@@ -377,6 +390,37 @@ int main(int argc, char **argv) {
         g_workers[i].thread_id = i;
         pthread_create(&g_workers[i].tid, NULL, worker_thread, &g_workers[i]);
     }
-    for (int i = 0; i < nw; i++) pthread_join(g_workers[i].tid, NULL);
+    /* Graceful shutdown (e.g. a Kubernetes pod stopping): on SIGTERM stop
+     * accepting, let every client finish what's in flight, close clients as
+     * they go idle, and exit once none are left -- or after
+     * shutdown-timeout seconds, or on a second signal. */
+    int sig;
+    sigwait(&stopsigs, &sig);
+    printf("Received %s: draining clients (up to %ds)...\n", sig == SIGTERM ? "SIGTERM" : "SIGINT",
+           g_config.shutdown_timeout);
+    atomic_store(&g_shutdown, 1);
+    /* No new unix-socket clients from here on (the listener itself stays
+     * open until exit: workers still compare fds against it). */
+    if (g_config.unix_socket_path[0]) unlink(g_config.unix_socket_path);
+    for (int i = 0; i < nw; i++) {
+        char b = 's';
+        if (g_workers[i].wake_w >= 0 && write(g_workers[i].wake_w, &b, 1) < 0) {}
+    }
+    struct timespec tick = {0, 100 * 1000000L};
+    for (int waited_ms = 0;; waited_ms += 100) {
+        int left = 0;
+        for (int i = 0; i < nw; i++) left += atomic_load(&g_workers[i].nclients);
+        if (left == 0) break;
+        if (waited_ms >= g_config.shutdown_timeout * 1000) {
+            printf("Shutdown timeout: closing %d remaining client(s)\n", left);
+            break;
+        }
+        if (sigtimedwait(&stopsigs, NULL, &tick) > 0) {
+            printf("Second signal: exiting now (%d client(s) still connected)\n", left);
+            break;
+        }
+    }
+    if (g_config.unix_socket_path[0]) unlink(g_config.unix_socket_path);
+    printf("Bye.\n");
     return 0;
 }

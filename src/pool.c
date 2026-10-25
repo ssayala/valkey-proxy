@@ -30,7 +30,8 @@ static int pool_new_fd(Worker *w, ConnPool *p, TlsConn **ssl_out) {
      * (a replica still finishing promotion, a node about to be grace-
      * released) would otherwise stall every client this worker is serving,
      * not just the one triggering the (re)connect. */
-    int fd = backend_connect_blocking(node->ip, node->port, g_config.backend_connect_timeout_ms, ssl_out);
+    int fd = backend_connect_blocking(node->ip, node->port, &node->sa, node->salen, g_config.backend_connect_timeout_ms,
+                                      ssl_out);
     if (fd < 0) return -1;
     if (p->db != 0 && send_select(fd, *ssl_out, p->db) < 0) {
         close_conn_fd(fd, *ssl_out);
@@ -124,8 +125,10 @@ struct ConnectJob {
     Worker *w;
     ConnPool *p;
     int gen; /* w->topo.node_gen[p->node_idx] at submission */
-    char ip[64];
+    char ip[256];
     int port, db;
+    struct sockaddr_storage sa; /* resolved by discovery: no DNS in the connector either */
+    socklen_t salen;
     int fd;
     TlsConn *ssl;
     ConnectJob *next;
@@ -146,7 +149,7 @@ static void *connector_loop(void *arg) {
         if (!cj_head) cj_tail = NULL;
         pthread_mutex_unlock(&cj_mu);
 
-        j->fd = backend_connect_blocking(j->ip, j->port, g_config.backend_connect_timeout_ms, &j->ssl);
+        j->fd = backend_connect_blocking(j->ip, j->port, &j->sa, j->salen, g_config.backend_connect_timeout_ms, &j->ssl);
         if (j->fd >= 0 && j->db != 0 && send_select(j->fd, j->ssl, j->db) < 0) {
             close_conn_fd(j->fd, j->ssl);
             j->fd = -1;
@@ -186,6 +189,8 @@ static void pool_connect_async(Worker *w, ConnPool *p) {
     j->gen = w->topo.node_gen[p->node_idx];
     snprintf(j->ip, sizeof(j->ip), "%s", nd->ip);
     j->port = nd->port;
+    j->sa = nd->sa;
+    j->salen = nd->salen;
     j->db = p->db;
     p->pending++;
     pthread_mutex_lock(&cj_mu);

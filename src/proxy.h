@@ -367,10 +367,16 @@ struct FanoutCtx {
 
 /* ── cluster / config ───────────────────────────────────────────────── */
 typedef struct {
-    char node_id[64], ip[64];
+    char node_id[64];
+    char ip[256];       /* address to connect to: IPv4/IPv6 literal, or a hostname */
+    char hostname[256]; /* announced hostname (cluster-announce-hostname), "" if none */
     int port;
     char flags[128];
     int is_master;
+    /* ip:port resolved by the refresh thread / startup discovery, so worker
+     * threads can connect without blocking on DNS (salen 0 = unresolved). */
+    struct sockaddr_storage sa;
+    socklen_t salen;
 } ClusterNode;
 
 /* Per-worker frozen view of the cluster topology, refreshed wholesale from
@@ -433,12 +439,14 @@ typedef struct {
     uint8_t *uring_fd; /* fds whose I/O goes through the ring, not epoll */
     time_t now;
     time_t last_sweep;
+    atomic_int nclients; /* read by main during shutdown */
+    int draining;        /* stopped accepting after SIGTERM (see worker_drain()) */
 } Worker;
 
 typedef struct {
-    char server_ip[64];
+    char server_ip[256]; /* seed node: IP literal or hostname (e.g. a Kubernetes Service) */
     int server_port;
-    char bind_ip[64];
+    char bind_ip[256];
     int proxy_port;
     int worker_thread_no, db;
     char unix_socket_path[256];
@@ -465,6 +473,8 @@ typedef struct {
     int verbose; /* "verbose yes": per-command/per-connection logging */
     int max_command_size; /* largest single client command accepted */
     int client_timeout;        /* "timeout": close clients idle this many seconds (0 = never) */
+    int shutdown_timeout;      /* seconds to drain clients after SIGTERM before exiting */
+    int unix_socket_perm;      /* chmod for the unix socket, 0 = leave the umask default */
     int tls_handshake_timeout; /* seconds a client gets to finish its TLS handshake */
     int worker_cpu_affinity; /* pin worker i to CPU (cpu_affinity_base + i) */
     int io_uring;            /* use io_uring for plain-TCP client/backend I/O (USE_IOURING builds) */
@@ -500,9 +510,11 @@ extern atomic_int g_topology_version;
  * needed -- a plain atomic load at the point of use suffices. */
 extern atomic_int g_backend_resp3_active;
 extern atomic_llong g_next_client_id;
+extern atomic_int g_shutdown; /* set by main on SIGTERM/SIGINT */
 extern pthread_rwlock_t g_topology_lock;
 extern Worker g_workers[MAX_WORKERS];
 extern int g_tcp_fd, g_unix_fd;
+extern int g_listen_per_worker; /* each worker owns its TCP listener (SO_REUSEPORT) */
 #ifdef USE_TLS
 extern SSL_CTX *g_ssl_ctx;
 extern SSL_CTX *g_backend_ssl_ctx;
@@ -545,6 +557,10 @@ void parse_conf(const char *path);
 void set_nonblocking(int fd);
 int tcp_connect(const char *ip, int port);
 int tcp_connect_timeout(const char *ip, int port, int timeout_ms);
+int tcp_connect_addr(const struct sockaddr_storage *sa, socklen_t salen, const char *ip, int port, int timeout_ms);
+/* Resolves host (literal or name, IPv4/IPv6) to *sa; 0 on success. Blocking:
+ * never call from a worker thread for anything but a literal address. */
+int resolve_addr(const char *host, int port, struct sockaddr_storage *sa, socklen_t *salen);
 /* reuseport: SO_REUSEPORT, so each worker can bind its own socket to the
  * same address and the kernel load-balances new connections across them. */
 int create_tcp_listener(const char *ip, int port, int reuseport);
@@ -565,8 +581,10 @@ ssize_t net_write(int fd, TlsConn *ssl, const void *buf, size_t n, int *want);
 int net_write_all(int fd, TlsConn *ssl, const void *buf, size_t n);
 int net_short_read_drained(TlsConn *ssl);
 /* Connects to a backend node, blocking, including the TLS handshake when
- * tls-backend is on; *ssl_out gets the session (NULL for plain TCP). */
-int backend_connect_blocking(const char *ip, int port, int timeout_ms, TlsConn **ssl_out);
+ * tls-backend is on; *ssl_out gets the session (NULL for plain TCP). sa, if
+ * given, is ip:port already resolved (no DNS lookup then). */
+int backend_connect_blocking(const char *ip, int port, const struct sockaddr_storage *sa, socklen_t salen,
+                             int timeout_ms, TlsConn **ssl_out);
 
 /* ── cluster ────────────────────────────────────────────────────────── */
 void fetch_cluster_nodes(void);
@@ -725,6 +743,9 @@ int worker_has_ready_backlog(Worker *w);
 /* Closes idle / handshake-stalled clients; call once per second or so.
  * worker_sweep_interval_ms() is how long the loop may sleep (-1 = forever). */
 void worker_sweep_clients(Worker *w);
+/* After SIGTERM: stop accepting, then close each client once it has
+ * nothing in flight (see main()). */
+void worker_drain(Worker *w);
 int worker_sweep_interval_ms(void);
 
 /* ── backend / client event handlers ───────────────────────────────── */

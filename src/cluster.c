@@ -80,9 +80,9 @@ static void parse_cluster_nodes_into(const char *data, ClusterNode *out_nodes, i
             continue;
         }
 
-        char id[64], addr[128], flags[128], master[64], ping[32], pong[32], epoch[32], st[32];
+        char id[64], addr[640], flags[128], master[64], ping[32], pong[32], epoch[32], st[32];
         int nc = 0;
-        if (sscanf(p, "%63s %127s %127s %63s %31s %31s %31s %31s%n", id, addr, flags, master, ping, pong, epoch, st,
+        if (sscanf(p, "%63s %639s %127s %63s %31s %31s %31s %31s%n", id, addr, flags, master, ping, pong, epoch, st,
                    &nc) < 8) {
             if (eol) *eol = saved;
             p = eol ? eol + 1 : p + strlen(p);
@@ -106,8 +106,15 @@ static void parse_cluster_nodes_into(const char *data, ClusterNode *out_nodes, i
             continue;
         }
 
+        /* "ip:port@cport[,hostname]" -- ip may be IPv6 (no brackets), and
+         * may be empty when a node announces only a hostname. */
+        char hostname[256] = "";
         char *at = strchr(addr, '@');
-        if (at) *at = '\0';
+        if (at) {
+            char *comma = strchr(at, ',');
+            if (comma) snprintf(hostname, sizeof(hostname), "%s", comma + 1);
+            *at = '\0';
+        }
         char *colon = strrchr(addr, ':');
         if (!colon) {
             if (eol) *eol = saved;
@@ -116,7 +123,10 @@ static void parse_cluster_nodes_into(const char *data, ClusterNode *out_nodes, i
         }
         *colon = '\0';
         int nport = atoi(colon + 1);
-        if (!addr[0] || nport == 0) {
+        const char *connect_host = addr[0] ? addr : hostname;
+        struct sockaddr_storage nsa;
+        socklen_t nsalen = 0;
+        if (!connect_host[0] || nport == 0 || resolve_addr(connect_host, nport, &nsa, &nsalen) < 0) {
             if (eol) *eol = saved;
             p = eol ? eol + 1 : p + strlen(p);
             continue;
@@ -125,8 +135,11 @@ static void parse_cluster_nodes_into(const char *data, ClusterNode *out_nodes, i
         int ni = *out_count;
         ClusterNode *nd = &out_nodes[(*out_count)++];
         snprintf(nd->node_id, sizeof(nd->node_id), "%.63s", id);
-        snprintf(nd->ip, sizeof(nd->ip), "%.63s", addr);
+        snprintf(nd->ip, sizeof(nd->ip), "%.255s", connect_host);
+        snprintf(nd->hostname, sizeof(nd->hostname), "%s", hostname);
         nd->port = nport;
+        nd->sa = nsa;
+        nd->salen = nsalen;
         snprintf(nd->flags, sizeof(nd->flags), "%.127s", flags);
         nd->is_master = 1;
 
@@ -167,7 +180,7 @@ static int fetch_cluster_nodes_from(const char *ip, int port, ClusterNode *out_n
      * at 5s that alone would stretch every single cycle out to 5+ seconds,
      * badly slowing down how fast a real failover gets noticed. */
     TlsConn *ssl;
-    int fd = backend_connect_blocking(ip, port, g_config.backend_connect_timeout_ms, &ssl);
+    int fd = backend_connect_blocking(ip, port, NULL, 0, g_config.backend_connect_timeout_ms, &ssl);
     if (fd < 0) return -1;
     if (net_write_all(fd, ssl, CLUSTER_NODES_CMD, strlen(CLUSTER_NODES_CMD)) < 0) {
         discovery_close(fd, ssl);
@@ -200,7 +213,7 @@ static int fetch_cluster_nodes_from(const char *ip, int port, ClusterNode *out_n
 void fetch_cluster_nodes(void) {
     printf("Connecting to %s:%d to fetch cluster topology...\n", g_config.server_ip, g_config.server_port);
     TlsConn *ssl;
-    int fd = backend_connect_blocking(g_config.server_ip, g_config.server_port, 5000, &ssl);
+    int fd = backend_connect_blocking(g_config.server_ip, g_config.server_port, NULL, 0, 5000, &ssl);
     if (fd < 0) exit(1);
     if (net_write_all(fd, ssl, CLUSTER_NODES_CMD, strlen(CLUSTER_NODES_CMD)) < 0) {
         perror("write");
@@ -493,7 +506,7 @@ static void *topology_refresh_loop(void *arg) {
 
         ClusterNode dn[MAX_NODES];
         int dcount = 0, dslot[CLUSTER_SLOTS];
-        char used_ip[64];
+        char used_ip[256];
         int used_port;
         snprintf(used_ip, sizeof(used_ip), "%s", g_config.server_ip);
         used_port = g_config.server_port;

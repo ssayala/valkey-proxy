@@ -361,6 +361,10 @@ void uring_worker_loop(Worker *w) {
         }
         worker_after_events(w);
         worker_sweep_clients(w);
+        if (atomic_load_explicit(&g_shutdown, memory_order_relaxed)) {
+            worker_drain(w);
+            sweep_ms = worker_sweep_interval_ms();
+        }
     }
 }
 #endif

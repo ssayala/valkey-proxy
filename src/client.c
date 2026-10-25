@@ -18,6 +18,7 @@ void client_send_crossslot(ClientConn *client) {
 void close_client(Worker *w, ClientConn *client) {
     int fd = client->fd;
     w->close_seq++;
+    atomic_fetch_sub(&w->nclients, 1);
 #ifdef USE_IOURING
     if (client->uring) uring_detach_client(w, client); /* before its buffers are freed */
 #endif

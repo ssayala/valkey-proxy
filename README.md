@@ -26,7 +26,10 @@ git config blame.ignoreRevsFile .git-blame-ignore-revs   # skip the bulk-format 
 ```
 
 ## Configuration
-Create a `proxy.conf` file before starting the proxy. All four parameters are required:
+For running it as a Kubernetes sidecar see [docs/KUBERNETES.md](docs/KUBERNETES.md).
+
+Create a `proxy.conf` file before starting the proxy. All four parameters are required
+(`server-ip` and `bind` accept IPv4/IPv6 addresses or hostnames):
 
 ```
 # One node in the Valkey cluster (used to discover the full topology)

@@ -1,4 +1,7 @@
 #include "proxy.h"
+#include <netdb.h>
+#include <sys/stat.h>
+#include <netinet/tcp.h>
 
 /* ── config parsing ─────────────────────────────────────────────────── */
 void parse_conf(const char *path) {
@@ -19,6 +22,7 @@ void parse_conf(const char *path) {
     g_config.backend_connect_timeout_ms = 1000;
     g_config.max_command_size = 512 * 1024 * 1024;
     g_config.tls_handshake_timeout = 10;
+    g_config.shutdown_timeout = 10;
 #ifdef USE_IOURING
     g_config.io_uring = 1; /* built in on purpose: on unless "io-uring no" */
 #endif
@@ -27,11 +31,11 @@ void parse_conf(const char *path) {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (sscanf(line, "%63s %447s", key, val) != 2) continue;
         if (!strcmp(key, "server-ip"))
-            snprintf(g_config.server_ip, 64, "%.63s", val);
+            snprintf(g_config.server_ip, sizeof(g_config.server_ip), "%.255s", val);
         else if (!strcmp(key, "server-port"))
             g_config.server_port = atoi(val);
         else if (!strcmp(key, "bind"))
-            snprintf(g_config.bind_ip, 64, "%.63s", val);
+            snprintf(g_config.bind_ip, sizeof(g_config.bind_ip), "%.255s", val);
         else if (!strcmp(key, "port"))
             g_config.proxy_port = atoi(val);
         else if (!strcmp(key, "worker-thread-no"))
@@ -70,6 +74,10 @@ void parse_conf(const char *path) {
             g_config.cluster_refresh_interval_ms = atoi(val);
         else if (!strcmp(key, "cluster_node_fail_grace_ms"))
             g_config.cluster_node_fail_grace_ms = atoi(val);
+        else if (!strcmp(key, "shutdown-timeout"))
+            g_config.shutdown_timeout = atoi(val);
+        else if (!strcmp(key, "unix-socket-perm"))
+            g_config.unix_socket_perm = (int)strtol(val, NULL, 8);
         else if (!strcmp(key, "timeout"))
             g_config.client_timeout = atoi(val);
         else if (!strcmp(key, "tls-handshake-timeout"))
@@ -131,25 +139,49 @@ void set_nonblocking(int fd) {
  * possibly still-booting promoted replica) and the periodic topology
  * refresh (its own thread, but retried every cycle) both want to fail fast
  * instead of tying up a thread for seconds on end. */
+int resolve_addr(const char *host, int port, struct sockaddr_storage *sa, socklen_t *salen) {
+    char ps[16];
+    snprintf(ps, sizeof(ps), "%d", port);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICSERV | AI_ADDRCONFIG;
+    int rc = getaddrinfo(host, ps, &hints, &res);
+    if (rc != 0 || !res) {
+        fprintf(stderr, "Could not resolve %s: %s\n", host, gai_strerror(rc));
+        return -1;
+    }
+    memcpy(sa, res->ai_addr, res->ai_addrlen);
+    *salen = res->ai_addrlen;
+    freeaddrinfo(res);
+    return 0;
+}
+
 int tcp_connect_timeout(const char *ip, int port, int timeout_ms) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_storage a;
+    socklen_t alen;
+    if (resolve_addr(ip, port, &a, &alen) < 0) return -1;
+    return tcp_connect_addr(&a, alen, ip, port, timeout_ms);
+}
+
+/* As tcp_connect_timeout(), to an already-resolved address (ip/port only
+ * label error messages). */
+int tcp_connect_addr(const struct sockaddr_storage *sa, socklen_t salen, const char *ip, int port, int timeout_ms) {
+    struct sockaddr_storage a = *sa;
+    socklen_t alen = salen;
+    int fd = socket(a.ss_family, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("socket");
         return -1;
     }
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) {
-        close(fd);
-        return -1;
-    }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    int ret = connect(fd, (struct sockaddr *)&a, sizeof(a));
+    int ret = connect(fd, (struct sockaddr *)&a, alen);
     if (ret < 0 && errno != EINPROGRESS) {
         if (errno == ECONNREFUSED)
             fprintf(stderr, "Could not connect to Valkey at %s:%d: Connection refused\n", ip, port);
@@ -190,14 +222,39 @@ int tcp_connect(const char *ip, int port) {
     return tcp_connect_timeout(ip, port, 5000);
 }
 
+/* ip: an IPv4/IPv6 literal or hostname; "" = all interfaces (dual-stack
+ * "::" where IPv6 is available, else 0.0.0.0). */
 int create_tcp_listener(const char *ip, int port, int reuseport) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_storage a;
+    socklen_t alen;
+    memset(&a, 0, sizeof(a));
+    int any = !ip[0];
+    if (any) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&a;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_addr = in6addr_any;
+        a6->sin6_port = htons((uint16_t)port);
+        alen = sizeof(*a6);
+    } else if (resolve_addr(ip, port, &a, &alen) < 0) {
+        return -1;
+    }
+    int fd = socket(a.ss_family, SOCK_STREAM, 0);
+    if (fd < 0 && any) { /* no IPv6 here: plain IPv4 any-address */
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&a;
+        memset(&a, 0, sizeof(a));
+        a4->sin_family = AF_INET;
+        a4->sin_addr.s_addr = INADDR_ANY;
+        a4->sin_port = htons((uint16_t)port);
+        alen = sizeof(*a4);
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+    }
     if (fd < 0) {
         perror("socket");
         return -1;
     }
-    int yes = 1;
+    int yes = 1, no = 0;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    if (a.ss_family == AF_INET6 && any) setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
 #ifdef SO_REUSEPORT
     if (reuseport && setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) < 0) {
         perror("setsockopt(SO_REUSEPORT)");
@@ -208,15 +265,7 @@ int create_tcp_listener(const char *ip, int port, int reuseport) {
     (void)reuseport;
 #endif
     set_nonblocking(fd);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port = htons((uint16_t)port);
-    if (ip[0])
-        inet_pton(AF_INET, ip, &a.sin_addr);
-    else
-        a.sin_addr.s_addr = INADDR_ANY;
-    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+    if (bind(fd, (struct sockaddr *)&a, alen) < 0) {
         perror("bind");
         close(fd);
         return -1;
@@ -235,13 +284,19 @@ int create_unix_listener(const char *path) {
         perror("socket(unix)");
         return -1;
     }
+    struct sockaddr_un a;
+    if (strlen(path) >= sizeof(a.sun_path)) {
+        fprintf(stderr, "unix-socket path too long (max %zu bytes): %s\n", sizeof(a.sun_path) - 1, path);
+        close(fd);
+        return -1;
+    }
     set_nonblocking(fd);
     unlink(path);
-    struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
     snprintf(a.sun_path, sizeof(a.sun_path), "%.107s", path);
-    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 ||
+        (g_config.unix_socket_perm && chmod(path, (mode_t)g_config.unix_socket_perm) < 0)) {
         perror("bind(unix)");
         close(fd);
         return -1;
@@ -256,9 +311,10 @@ int create_unix_listener(const char *path) {
 
 /* Blocking connect (+ TLS handshake when tls-backend is on) to a backend
  * node; returns a blocking fd, or -1. */
-int backend_connect_blocking(const char *ip, int port, int timeout_ms, TlsConn **ssl_out) {
+int backend_connect_blocking(const char *ip, int port, const struct sockaddr_storage *sa, socklen_t salen,
+                             int timeout_ms, TlsConn **ssl_out) {
     *ssl_out = NULL;
-    int fd = tcp_connect_timeout(ip, port, timeout_ms);
+    int fd = (sa && salen) ? tcp_connect_addr(sa, salen, ip, port, timeout_ms) : tcp_connect_timeout(ip, port, timeout_ms);
     if (fd < 0) return -1;
 #ifdef USE_TLS
     if (g_config.tls_backend) {
