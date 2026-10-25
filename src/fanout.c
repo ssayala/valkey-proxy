@@ -1238,7 +1238,7 @@ static void fanout_route_single(Worker *w, ClientConn *client, int node_idx) {
         return;
     }
     ConnPool *pool = &grp->node_pools[node_idx].pools[POOL_NORMAL];
-    PoolConn *conn = pool_acquire_nb(w, pool);
+    PoolConn *conn = pool_acquire_or_connect(w, pool);
     if (!conn) {
         client->state = CS_WAITING_CONN;
         fd_unwatch(w, client->fd, EL_READABLE);
@@ -1859,7 +1859,7 @@ void handle_pubsub_inspect_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
         ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
         if (!conn) {
             client->node_idx = ni;
             client->state = CS_WAITING_CONN;
@@ -2040,7 +2040,7 @@ void handle_slowlog_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
         ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
         if (!conn) {
             client->node_idx = ni;
             client->state = CS_WAITING_CONN;
@@ -2171,7 +2171,7 @@ void handle_commandlog_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
         ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
         if (!conn) {
             client->node_idx = ni;
             client->state = CS_WAITING_CONN;
@@ -2283,7 +2283,7 @@ void handle_module_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
         ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
         if (!conn) {
             client->node_idx = ni;
             client->state = CS_WAITING_CONN;
@@ -2637,7 +2637,7 @@ void handle_script_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
         ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
         if (!conn) {
             client->node_idx = ni;
             client->state = CS_WAITING_CONN;
@@ -2815,7 +2815,7 @@ void handle_function_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
         ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
         if (!conn) {
             client->node_idx = ni;
             client->state = CS_WAITING_CONN;
@@ -3077,7 +3077,7 @@ void handle_command_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
         ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
         if (!conn) {
             client->node_idx = ni;
             client->state = CS_WAITING_CONN;
@@ -3212,7 +3212,7 @@ void handle_command_cmd(Worker *w, ClientConn *client, int cmdlen) {
             return;
         }
         ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
         if (!conn) {
             client->node_idx = ni;
             client->state = CS_WAITING_CONN;
@@ -3412,7 +3412,7 @@ void handle_nokey_cmd(Worker *w, ClientConn *client, const char *cmd, int cmdlen
             return;
         }
         ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
         if (!conn) {
             client->node_idx = ni;
             client->state = CS_WAITING_CONN;
@@ -3677,7 +3677,7 @@ void handle_multikey_complete(Worker *w, ClientConn *client, const char *cmd) {
     if ((!strcmp(cmd, "XREAD") || !strcmp(cmd, "XREADGROUP")) && resp_xread_has_block(client->pbuf, client->pbuf_len))
         mkey_pool = POOL_BLOCKING;
     ConnPool *pool = &grp->node_pools[node_idx].pools[mkey_pool];
-    PoolConn *conn = pool_acquire_nb(w, pool);
+    PoolConn *conn = pool_acquire_or_connect(w, pool);
     if (!conn) {
         client->state = CS_WAITING_CONN;
         fd_unwatch(w, client->fd, EL_READABLE);

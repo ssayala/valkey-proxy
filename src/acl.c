@@ -267,7 +267,7 @@ static void acl_forward_to_one_node(Worker *w, ClientConn *client) {
         return;
     }
     ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-    PoolConn *conn = pool_acquire_nb(w, pool);
+    PoolConn *conn = pool_acquire_or_connect(w, pool);
     if (!conn) {
         client->node_idx = ni;
         client->state = CS_WAITING_CONN;

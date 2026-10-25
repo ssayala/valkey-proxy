@@ -38,7 +38,10 @@ port  7777
 ```
 Optional parameters:
 ```
-worker-thread-no  1    # number of worker threads (default: 1)
+worker-thread-no  1    # number of worker threads (default: 1); on Linux each gets its own
+                       # SO_REUSEPORT listener, so the kernel spreads connections evenly
+worker-cpu-affinity  no  # pin worker i to CPU (cpu-affinity-base + i) (default: no)
+cpu-affinity-base    0
 db                0    # default database (default: 0)
 
 # Connection pool sizes

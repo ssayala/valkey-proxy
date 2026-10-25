@@ -39,7 +39,6 @@ static int pool_new_fd(Worker *w, ConnPool *p, TlsConn **ssl_out) {
     }
     set_nonblocking(fd);
     if (fd < g_config.max_connection) w->backend_map[fd] = NULL;
-    fd_watch(w, fd, EL_READABLE);
     return fd;
 }
 
@@ -52,6 +51,48 @@ static int pool_new_fd(Worker *w, ConnPool *p, TlsConn **ssl_out) {
  * live connections (unlike re-running pool_init, which would wipe them):
  * used both for a brand-new pool's initial warm-up and for topping an
  * existing pool back up after worker_sync_topology() flushes it. */
+/* Installs a freshly connected fd as a new connection of pool p (room is
+ * guaranteed by the caller) and hands it straight to the longest-waiting
+ * client, if any -- otherwise a client that queued up while this pool had
+ * zero live connections (e.g. its node just died) would never be woken even
+ * once the pool is repopulated, since nothing but pool_release() ever
+ * drains wait_queue. Mirrors pool_release()'s own waiter hand-off. */
+static void pool_add_conn(Worker *w, ConnPool *p, int fd, TlsConn *ssl, int startup) {
+    const ClusterNode *node = &w->topo.nodes[p->node_idx];
+    PoolConn *c = &p->conns[p->count];
+    memset(c, 0, sizeof(*c));
+    c->fd = fd;
+    c->ssl = ssl;
+    c->state = CONN_AVAILABLE;
+    c->db = p->db;
+    c->pool = p;
+    if (fd < g_config.max_connection) w->backend_map[fd] = c;
+    fd_watch(w, fd, EL_READABLE);
+    if (startup)
+        printf("        [%d] fd=%-4d  %s:%d  db=%d\n", p->count, fd, node->ip, node->port, p->db);
+    else
+        LOG_VERBOSE("[worker %d] [pool:%s] connected fd=%d node=%s:%d (%d/%d)\n", w->thread_id, POOL_NAME[p->type], fd,
+                    node->ip, node->port, p->count + 1, p->max);
+    p->count++;
+    if (p->wait_len > 0) {
+        ClientConn *next = p->wait_queue[0];
+        memmove(p->wait_queue, p->wait_queue + 1, (size_t)(p->wait_len - 1) * sizeof(ClientConn *));
+        p->wait_len--;
+        next->waiting_pool = NULL;
+        c->state = CONN_IN_USE;
+        c->waiting_client = next;
+        c->epoch++;
+        next->pending_conn = c;
+        LOG_VERBOSE("        [%d] fd=%-4d  %s:%d  db=%d  → reassigned to client-fd=%d  (queue=%d)\n", p->count - 1, fd,
+                    node->ip, node->port, p->db, next->fd, p->wait_len);
+        resume_client_after_conn(w, next, c);
+    }
+}
+
+/* Synchronously creates AVAILABLE connections until the pool reaches `want`
+ * or p->max, stopping at the first failure. Only used for a brand-new pool's
+ * warm-up (worker start-up / a newly discovered shard); later growth and
+ * reconnects go through pool_connect_async(). */
 static void pool_fill_to(Worker *w, ConnPool *p, int want) {
     if (want <= 0) return;
     if (!p->conns) {
@@ -59,63 +100,158 @@ static void pool_fill_to(Worker *w, ConnPool *p, int want) {
         if (!p->conns) return;
     }
     const ClusterNode *node = &w->topo.nodes[p->node_idx];
-    while (p->count < want && p->count < p->max) {
+    while (p->count < want && p->count + p->pending < p->max) {
         TlsConn *ssl;
         int fd = pool_new_fd(w, p, &ssl);
         if (fd < 0) {
             fprintf(stderr, "        [%d] %s:%d FAILED\n", p->count, node->ip, node->port);
             break;
         }
-        PoolConn *c = &p->conns[p->count];
-        c->fd = fd;
-        c->ssl = ssl;
-        c->state = CONN_AVAILABLE;
-        c->db = p->db;
-        c->pool = p;
-        c->waiting_client = NULL;
-        c->wbuf = NULL;
-        c->wbuf_len = c->wbuf_off = c->wbuf_cap = 0;
-        c->rbuf = NULL;
-        c->rbuf_len = c->rbuf_cap = 0;
-        c->acl_authenticating = 0;
-        c->acl_is_login_probe = 0;
-        c->acl_hello_login = 0;
-        c->acl_hello_resp3 = 0;
-        c->resp3 = 0;
-        c->resp3_handshake = 0;
-        c->resp3_probe = 0;
-        c->resp3_deferred_cmd = NULL;
-        c->resp3_deferred_len = c->resp3_deferred_cap = 0;
-        c->discard_on_release = 0;
-        if (fd < g_config.max_connection) w->backend_map[fd] = c;
-        printf("        [%d] fd=%-4d  %s:%d  db=%d\n", p->count, fd, node->ip, node->port, p->db);
-        p->count++;
-        /* Hand this brand-new connection straight to whoever's been parked
-         * in wait_queue the longest instead of leaving it CONN_AVAILABLE --
-         * otherwise a client that queued up while this pool had zero live
-         * connections (e.g. its node just died) would never be woken even
-         * once the pool is successfully repopulated, since nothing but
-         * pool_release() ever drains wait_queue. Mirrors pool_release()'s
-         * own waiter hand-off below. */
-        if (p->wait_len > 0) {
-            ClientConn *next = p->wait_queue[0];
-            memmove(p->wait_queue, p->wait_queue + 1, (size_t)(p->wait_len - 1) * sizeof(ClientConn *));
-            p->wait_len--;
-            c->state = CONN_IN_USE;
-            c->waiting_client = next;
-            c->epoch++;
-            next->pending_conn = c;
-            printf("        [%d] fd=%-4d  %s:%d  db=%d  → reassigned to client-fd=%d  (queue=%d)\n", p->count - 1, fd,
-                   node->ip, node->port, p->db, next->fd, p->wait_len);
-            resume_client_after_conn(w, next, c);
-        }
+        pool_add_conn(w, p, fd, ssl, 1);
     }
 }
 
-void pool_init(Worker *w, ConnPool *p, PoolType type, int node_idx, int db) {
+/* ── background connects ───────────────────────────────────────────────
+ * Connecting (TCP, TLS handshake, SELECT) is blocking, so pool growth after
+ * start-up runs on a few connector threads instead of the worker: a slow or
+ * unreachable node would otherwise stall every client on the worker for up
+ * to backend_connect_timeout_ms. The requesting client waits in the pool's
+ * wait_queue, and the finished connection comes back through the worker's
+ * wake pipe (pool_drain_connects()). */
+#define CONNECTOR_THREADS 2
+
+struct ConnectJob {
+    Worker *w;
+    ConnPool *p;
+    int gen; /* w->topo.node_gen[p->node_idx] at submission */
+    char ip[64];
+    int port, db;
+    int fd;
+    TlsConn *ssl;
+    ConnectJob *next;
+};
+
+static pthread_mutex_t cj_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cj_cv = PTHREAD_COND_INITIALIZER;
+static ConnectJob *cj_head, *cj_tail;
+static pthread_once_t cj_once = PTHREAD_ONCE_INIT;
+
+static void *connector_loop(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&cj_mu);
+        while (!cj_head) pthread_cond_wait(&cj_cv, &cj_mu);
+        ConnectJob *j = cj_head;
+        cj_head = j->next;
+        if (!cj_head) cj_tail = NULL;
+        pthread_mutex_unlock(&cj_mu);
+
+        j->fd = backend_connect_blocking(j->ip, j->port, g_config.backend_connect_timeout_ms, &j->ssl);
+        if (j->fd >= 0 && j->db != 0 && send_select(j->fd, j->ssl, j->db) < 0) {
+            close_conn_fd(j->fd, j->ssl);
+            j->fd = -1;
+            j->ssl = NULL;
+        }
+        if (j->fd >= 0) set_nonblocking(j->fd);
+
+        Worker *w = j->w;
+        pthread_mutex_lock(&w->cj_mu);
+        j->next = w->cj_done;
+        w->cj_done = j;
+        pthread_mutex_unlock(&w->cj_mu);
+        char b = 'c';
+        ssize_t r = write(w->wake_w, &b, 1);
+        (void)r;
+    }
+    return NULL;
+}
+
+static void connector_start(void) {
+    for (int i = 0; i < CONNECTOR_THREADS; i++) {
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, connector_loop, NULL) == 0) pthread_detach(tid);
+    }
+}
+
+/* Queues one background connect for pool p if it has room. */
+static void pool_connect_async(Worker *w, ConnPool *p) {
+    if (p->count + p->pending >= p->max || w->wake_w < 0) return;
+    if (!p->conns && !(p->conns = calloc((size_t)p->max, sizeof(PoolConn)))) return;
+    ConnectJob *j = calloc(1, sizeof(*j));
+    if (!j) return;
+    pthread_once(&cj_once, connector_start);
+    const ClusterNode *nd = &w->topo.nodes[p->node_idx];
+    j->w = w;
+    j->p = p;
+    j->gen = w->topo.node_gen[p->node_idx];
+    snprintf(j->ip, sizeof(j->ip), "%s", nd->ip);
+    j->port = nd->port;
+    j->db = p->db;
+    p->pending++;
+    pthread_mutex_lock(&cj_mu);
+    if (cj_tail)
+        cj_tail->next = j;
+    else
+        cj_head = j;
+    cj_tail = j;
+    pthread_cond_signal(&cj_cv);
+    pthread_mutex_unlock(&cj_mu);
+}
+
+static void pool_fail_all_waiters(Worker *w, ConnPool *p, const char *msg);
+
+/* Worker side: installs connections finished by the connector threads. */
+void pool_drain_connects(Worker *w) {
+    pthread_mutex_lock(&w->cj_mu);
+    ConnectJob *j = w->cj_done;
+    w->cj_done = NULL;
+    pthread_mutex_unlock(&w->cj_mu);
+    while (j) {
+        ConnectJob *next = j->next;
+        ConnPool *p = j->p;
+        p->pending--;
+        int idx = p->node_idx;
+        int stale = j->gen != w->topo.node_gen[idx] || !w->topo.node_has_slots[idx];
+        if (j->fd >= 0 && (stale || j->fd >= g_config.max_connection)) {
+            close_conn_fd(j->fd, j->ssl);
+            j->fd = -1;
+        }
+        if (j->fd >= 0) {
+            pool_add_conn(w, p, j->fd, j->ssl, 0);
+        } else if (stale && w->topo.node_has_slots[idx] && p->wait_len > 0) {
+            pool_connect_async(w, p); /* node moved while connecting: retry at the new address */
+        } else if (p->count == 0 && p->pending == 0 && p->wait_len > 0) {
+            /* Nothing to wait for any more: fail them rather than hang. */
+            pool_fail_all_waiters(w, p, "backend connection error");
+        }
+        free(j);
+        j = next;
+    }
+}
+
+/* Like pool_acquire_nb(), but never connects on the worker thread: with no
+ * idle connection it queues a background connect (if the pool has room)
+ * and returns NULL, and the caller parks the client with
+ * pool_enqueue_waiter() as usual. */
+PoolConn *pool_acquire_or_connect(Worker *w, ConnPool *p) {
+    for (int i = 0; i < p->count; i++) {
+        if (p->conns[i].state == CONN_AVAILABLE) {
+            p->conns[i].state = CONN_IN_USE;
+            p->conns[i].epoch++;
+            return &p->conns[i];
+        }
+    }
+    pool_connect_async(w, p);
+    return NULL;
+}
+
+/* background: warm up via the connector threads instead of connecting on
+ * the worker thread (for shards discovered while serving traffic). */
+void pool_init(Worker *w, ConnPool *p, PoolType type, int node_idx, int db, int background) {
     p->type = type;
     p->max = g_pool_max[type];
     p->count = 0;
+    p->pending = 0;
     p->conns = NULL;
     p->node_idx = node_idx;
     p->db = db;
@@ -127,6 +263,10 @@ void pool_init(Worker *w, ConnPool *p, PoolType type, int node_idx, int db) {
     int want = g_pool_min[type];
     if (want == 0) {
         printf("      %-14s pool:  0/%d (on-demand)\n", POOL_NAME[type], p->max);
+        return;
+    }
+    if (background) {
+        for (int i = 0; i < want; i++) pool_connect_async(w, p);
         return;
     }
     printf("      %-14s pool: (0/%d)\n", POOL_NAME[type], p->max);
@@ -143,7 +283,9 @@ PoolConn *pool_acquire_nb(Worker *w, ConnPool *p) {
             return &p->conns[i];
         }
     }
-    if (p->count < p->max) {
+    /* Synchronous connect: only for callers that can't park the client in
+     * wait_queue (see pool_acquire_or_connect() for the rest). */
+    if (p->count + p->pending < p->max) {
         if (!p->conns) {
             p->conns = calloc((size_t)p->max, sizeof(PoolConn));
             if (!p->conns) return NULL;
@@ -153,22 +295,14 @@ PoolConn *pool_acquire_nb(Worker *w, ConnPool *p) {
         if (fd >= 0) {
             const ClusterNode *node = &w->topo.nodes[p->node_idx];
             PoolConn *c = &p->conns[p->count];
+            memset(c, 0, sizeof(*c));
             c->fd = fd;
             c->ssl = ssl;
             c->state = CONN_IN_USE;
             c->db = p->db;
             c->pool = p;
-            c->waiting_client = NULL;
-            c->wbuf = NULL;
-            c->wbuf_len = c->wbuf_off = c->wbuf_cap = 0;
-            c->rbuf = NULL;
-            c->rbuf_len = c->rbuf_cap = 0;
-            c->acl_authenticating = 0;
-            c->acl_is_login_probe = 0;
-            c->acl_hello_login = 0;
-            c->acl_hello_resp3 = 0;
-            c->discard_on_release = 0;
             if (fd < g_config.max_connection) w->backend_map[fd] = c;
+            fd_watch(w, fd, EL_READABLE);
             LOG_VERBOSE("  [%s pool] node [%s:%d] db=%d: new conn fd=%d (%d/%d)\n", POOL_NAME[p->type], node->ip, node->port,
                    p->db, fd, p->count + 1, p->max);
             p->count++;
@@ -221,67 +355,18 @@ static void pool_fail_all_waiters(Worker *w, ConnPool *p, const char *msg) {
     p->wait_len = 0;
 }
 
-/* Close conn's current fd, open a fresh one against p's node_idx (using the
- * *current* w->topo address -- which may since have changed under this same
- * index, e.g. after a failover), and rewire it in place onto the same
- * PoolConn slot. Returns 0 on success; on failure the PoolConn itself is
- * destroyed (via pool_destroy_conn) and -1 is returned, since there is
- * nothing left to hand back to the caller. */
-static int pool_reconnect_conn_or_destroy(Worker *w, PoolConn *c) {
-    ConnPool *p = c->pool;
-    int old_fd = c->fd;
-
-    TlsConn *newssl;
-    int newfd = pool_new_fd(w, p, &newssl);
-    if (newfd < 0) {
-        pool_destroy_conn(w, c);
-        return -1;
-    }
-
-    fd_unwatch(w, old_fd, EL_READABLE | EL_WRITABLE);
-    if (old_fd >= 0) {
-        if (old_fd < g_config.max_connection) w->backend_map[old_fd] = NULL;
-        close_conn_fd(old_fd, c->ssl);
-    }
-    free(c->wbuf);
-    c->wbuf = NULL;
-    c->wbuf_len = c->wbuf_off = c->wbuf_cap = 0;
-    free(c->rbuf);
-    c->rbuf = NULL;
-    c->rbuf_len = c->rbuf_cap = 0;
-    free(c->resp3_deferred_cmd);
-    c->resp3_deferred_cmd = NULL;
-    c->resp3_deferred_len = c->resp3_deferred_cap = 0;
-
-    c->fd = newfd;
-    c->ssl = newssl;
-    c->db = p->db;
-    c->acl_authenticating = 0;
-    c->acl_is_login_probe = 0;
-    c->acl_hello_login = 0;
-    c->acl_hello_resp3 = 0;
-    /* New fd -- must renegotiate RESP3 from scratch, same reasoning as the
-     * ACL auth reset just above. */
-    c->resp3 = 0;
-    c->resp3_handshake = 0;
-    c->resp3_probe = 0;
-    if (newfd < g_config.max_connection) w->backend_map[newfd] = c;
-
-    const ClusterNode *node = &w->topo.nodes[p->node_idx];
-    printf("[worker %d] [pool:%s] reconnected fd=%-4d node=%s:%d (topology change, was fd=%d)\n", w->thread_id,
-           POOL_NAME[p->type], newfd, node->ip, node->port, old_fd);
-    return 0;
-}
-
 void pool_release(Worker *w, PoolConn *c) {
     if (c->discard_on_release) {
         c->discard_on_release = 0;
         /* The underlying node identity moved on while this connection was
-         * checked out (see worker_sync_topology()). Reconnect it to the
-         * current address for its node_idx before handing it back to the
-         * pool/a waiter -- this is what lets an in-flight failover finish
-         * without disrupting whichever request currently holds it. */
-        if (pool_reconnect_conn_or_destroy(w, c) < 0) return;
+         * checked out (see worker_sync_topology()): retire it and connect a
+         * replacement at the node's current address in the background --
+         * this lets an in-flight failover finish without disrupting the
+         * request that held it, and any waiter gets the new connection. */
+        ConnPool *p = c->pool;
+        pool_destroy_conn(w, c);
+        if (p->wait_len > 0 || p->count + p->pending < g_pool_min[p->type]) pool_connect_async(w, p);
+        return;
     }
 
     ConnPool *p = c->pool;
@@ -399,7 +484,7 @@ static DbGroup *db_group_create(Worker *w, int db) {
         np->node_idx = ni;
         printf("    node [%s:%d]\n", w->topo.nodes[ni].ip, w->topo.nodes[ni].port);
         for (int pt = 0; pt < POOL_TYPE_COUNT; pt++) {
-            pool_init(w, &np->pools[pt], (PoolType)pt, ni, db);
+            pool_init(w, &np->pools[pt], (PoolType)pt, ni, db, 0);
             total += np->pools[pt].count;
         }
         np->gen = w->topo.node_gen[ni];
@@ -447,7 +532,7 @@ void worker_sync_topology(Worker *w) {
                 np->node_idx = idx;
                 printf("  [worker %d] db%d: new shard [%d] %s:%d discovered, warming pools\n", w->thread_id, grp->db,
                        idx, w->topo.nodes[idx].ip, w->topo.nodes[idx].port);
-                for (int pt = 0; pt < POOL_TYPE_COUNT; pt++) pool_init(w, &np->pools[pt], (PoolType)pt, idx, grp->db);
+                for (int pt = 0; pt < POOL_TYPE_COUNT; pt++) pool_init(w, &np->pools[pt], (PoolType)pt, idx, grp->db, 1);
                 np->gen = w->topo.node_gen[idx];
             } else if (np->gen != w->topo.node_gen[idx]) {
                 /* Whether this gen bump means "a new/promoted node took over
@@ -506,7 +591,11 @@ void worker_sync_topology(Worker *w) {
                      * (scenario 3) finish without a client-visible gap. Skip
                      * it when the index no longer owns any slot at all
                      * (scenario 2): there is nothing live to reconnect to. */
-                    if (still_owns_slots) pool_fill_to(w, p, g_pool_min[pt]);
+                    if (still_owns_slots) {
+                        int want = g_pool_min[pt] > 0 ? g_pool_min[pt] : (p->wait_len > 0);
+                        while (p->count + p->pending < want && p->count + p->pending < p->max)
+                            pool_connect_async(w, p);
+                    }
                     /* Scenario 2: this node is gone for good and nothing will
                      * ever call pool_release()/pool_fill_to() on this pool
                      * again, so anyone already parked in wait_queue (e.g. a

@@ -1,3 +1,6 @@
+#ifdef __linux__
+#define _GNU_SOURCE /* pthread_setaffinity_np, CPU_SET */
+#endif
 #include "proxy.h"
 #include <sys/resource.h>
 #include <netinet/tcp.h>
@@ -124,7 +127,7 @@ static void do_accept(Worker *w, int listen_fd) {
         /* TCP clients only (a local unix socket stays plaintext). The
          * handshake runs non-blocking from the event loop, driven by
          * handle_client_readable()/writable() via client_tls_continue(). */
-        if (g_config.tls_enabled && g_ssl_ctx && listen_fd == g_tcp_fd) {
+        if (g_config.tls_enabled && g_ssl_ctx && listen_fd != g_unix_fd) {
             client->ssl = tls_new(fd, 1);
             if (!client->ssl) {
                 close(fd);
@@ -162,12 +165,23 @@ static void *worker_thread(void *arg) {
         return NULL;
     }
     pthread_mutex_init(&w->db_lock, NULL);
+    pthread_mutex_init(&w->cj_mu, NULL);
     if (!w->el) {
         fprintf(stderr, "el_create failed\n");
         return NULL;
     }
 
-    if (g_tcp_fd >= 0) fd_watch(w, g_tcp_fd, EL_READABLE);
+#ifdef __linux__
+    if (g_config.worker_cpu_affinity) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        CPU_SET((g_config.cpu_affinity_base + w->thread_id) % (ncpu > 0 ? ncpu : 1), &set);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
+            fprintf(stderr, "[worker %d] could not set CPU affinity\n", w->thread_id);
+    }
+#endif
+    if (w->listen_fd >= 0) fd_watch(w, w->listen_fd, EL_READABLE);
     if (g_unix_fd >= 0) fd_watch(w, g_unix_fd, EL_READABLE);
 
     /* Self-pipe so the topology refresh thread can pull this worker straight
@@ -215,7 +229,7 @@ static void *worker_thread(void *arg) {
         for (int i = 0; i < n; i++) {
             int fd = w->el->fired[i].fd;
             int mask = w->el->fired[i].mask;
-            if (fd == g_tcp_fd || fd == g_unix_fd) {
+            if (fd == w->listen_fd || fd == g_unix_fd) {
                 do_accept(w, fd);
                 continue;
             }
@@ -225,6 +239,7 @@ static void *worker_thread(void *arg) {
                  * doesn't accumulate unread bytes across many wake-ups. */
                 char drain[256];
                 while (read(fd, drain, sizeof(drain)) > 0) {}
+                pool_drain_connects(w);
                 continue;
             }
             if (fd < 0 || fd >= g_config.max_connection) continue;
@@ -301,9 +316,31 @@ int main(int argc, char **argv) {
     fetch_cluster_nodes();
     topology_start_refresh_thread();
 
-    g_tcp_fd = create_tcp_listener(g_config.bind_ip, g_config.proxy_port);
-    if (g_tcp_fd < 0) exit(1);
-    printf("Listening on %s:%d (TCP)\n", g_config.bind_ip, g_config.proxy_port);
+    int nw = g_config.worker_thread_no;
+    if (nw < 1) nw = 1;
+    if (nw > MAX_WORKERS) nw = MAX_WORKERS;
+
+    /* Linux: one SO_REUSEPORT listener per worker, all bound before any
+     * worker starts accepting, so the kernel spreads new connections evenly
+     * instead of every worker racing on one shared socket (whichever wakes
+     * first wins, which left some workers with half the load of others).
+     * Elsewhere SO_REUSEPORT doesn't load-balance, so share one socket. */
+#ifdef __linux__
+    int per_worker = 1;
+#else
+    int per_worker = 0;
+#endif
+    for (int i = 0; i < nw; i++) {
+        if (i == 0 || per_worker) {
+            g_workers[i].listen_fd = create_tcp_listener(g_config.bind_ip, g_config.proxy_port, per_worker);
+            if (g_workers[i].listen_fd < 0) exit(1);
+        } else {
+            g_workers[i].listen_fd = g_workers[0].listen_fd;
+        }
+    }
+    g_tcp_fd = g_workers[0].listen_fd;
+    printf("Listening on %s:%d (TCP%s)\n", g_config.bind_ip, g_config.proxy_port,
+           per_worker && nw > 1 ? ", one SO_REUSEPORT socket per worker" : "");
 
     if (g_config.unix_socket_path[0]) {
         g_unix_fd = create_unix_listener(g_config.unix_socket_path);
@@ -312,9 +349,6 @@ int main(int argc, char **argv) {
     }
     printf("\n");
 
-    int nw = g_config.worker_thread_no;
-    if (nw < 1) nw = 1;
-    if (nw > MAX_WORKERS) nw = MAX_WORKERS;
     printf("Starting %d worker thread(s)...\n\n", nw);
 
     for (int i = 0; i < nw; i++) {

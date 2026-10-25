@@ -532,7 +532,7 @@ void legacy_dispatch(Worker *w, ClientConn *client, char *cmd, int cmdlen, char 
                     return;
                 }
                 ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-                PoolConn *conn = pool_acquire_nb(w, pool);
+                PoolConn *conn = pool_acquire_or_connect(w, pool);
                 if (!conn) {
                     client->node_idx = ni;
                     client->state = CS_WAITING_CONN;
@@ -565,7 +565,7 @@ void legacy_dispatch(Worker *w, ClientConn *client, char *cmd, int cmdlen, char 
                     return;
                 }
                 ConnPool *pool = &grp->node_pools[ni].pools[POOL_NORMAL];
-                PoolConn *conn = pool_acquire_nb(w, pool);
+                PoolConn *conn = pool_acquire_or_connect(w, pool);
                 if (!conn) {
                     client->node_idx = ni;
                     client->state = CS_WAITING_CONN;
@@ -634,7 +634,7 @@ void legacy_dispatch(Worker *w, ClientConn *client, char *cmd, int cmdlen, char 
             return;
         }
         ConnPool *pool = &grp->node_pools[node_idx].pools[POOL_NORMAL];
-        PoolConn *conn = pool_acquire_nb(w, pool);
+        PoolConn *conn = pool_acquire_or_connect(w, pool);
 
         if (!conn) {
             client->state = CS_WAITING_CONN;

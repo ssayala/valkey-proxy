@@ -81,6 +81,7 @@ typedef struct ClientConn ClientConn;
 typedef struct FanoutSub FanoutSub;
 typedef struct FanoutCtx FanoutCtx;
 typedef struct MuxConn MuxConn;
+typedef struct ConnectJob ConnectJob;
 typedef struct Req Req;
 
 /* ── pool connection ────────────────────────────────────────────────── */
@@ -153,6 +154,7 @@ struct ConnPool {
     int node_idx, db;
     EventLoop *el;
     pthread_mutex_t lock;
+    int pending; /* background connects in flight (see pool_connect_async()) */
     ClientConn **wait_queue;
     int wait_len, wait_cap;
 };
@@ -391,6 +393,12 @@ typedef struct {
      * published, instead of waiting for it to next wake up on its own via
      * client/backend traffic. -1 until worker_thread() sets it up. */
     int wake_r, wake_w;
+    /* This worker's own TCP listener (SO_REUSEPORT, Linux), or the shared
+     * g_tcp_fd where per-worker listeners aren't available. */
+    int listen_fd;
+    /* Connections finished by the connector threads (see pool.c). */
+    pthread_mutex_t cj_mu;
+    ConnectJob *cj_done;
     /* ── pipelined fast path (see src/mux.c) ── */
     MuxConn **mux_map;
     Req *req_free;
@@ -430,6 +438,8 @@ typedef struct {
     int backend_connect_timeout_ms;
     int verbose; /* "verbose yes": per-command/per-connection logging */
     int max_command_size; /* largest single client command accepted */
+    int worker_cpu_affinity; /* pin worker i to CPU (cpu_affinity_base + i) */
+    int cpu_affinity_base;
 } Config;
 
 /* ── globals ────────────────────────────────────────────────────────── */
@@ -497,7 +507,9 @@ void parse_conf(const char *path);
 void set_nonblocking(int fd);
 int tcp_connect(const char *ip, int port);
 int tcp_connect_timeout(const char *ip, int port, int timeout_ms);
-int create_tcp_listener(const char *ip, int port);
+/* reuseport: SO_REUSEPORT, so each worker can bind its own socket to the
+ * same address and the kernel load-balances new connections across them. */
+int create_tcp_listener(const char *ip, int port, int reuseport);
 int create_unix_listener(const char *path);
 #ifdef USE_TLS
 int init_tls(void);
@@ -568,8 +580,10 @@ int resp3_flatten_pairs(const char *buf, int len, char **out, int *out_len);
 int resp3_nest_pairs(const char *buf, int len, char **out, int *out_len);
 
 /* ── connection pool ────────────────────────────────────────────────── */
-void pool_init(Worker *w, ConnPool *p, PoolType type, int node_idx, int db);
+void pool_init(Worker *w, ConnPool *p, PoolType type, int node_idx, int db, int background);
 PoolConn *pool_acquire_nb(Worker *w, ConnPool *p);
+PoolConn *pool_acquire_or_connect(Worker *w, ConnPool *p);
+void pool_drain_connects(Worker *w);
 void pool_enqueue_waiter(ConnPool *p, ClientConn *client);
 void pool_remove_waiter(ConnPool *p, ClientConn *client);
 void pool_release(Worker *w, PoolConn *c);

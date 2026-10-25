@@ -218,7 +218,7 @@ void handle_blocking_complete(Worker *w, ClientConn *client, const char *cmd) {
         return;
     }
     ConnPool *pool = &grp->node_pools[node_idx].pools[POOL_BLOCKING];
-    PoolConn *conn = pool_acquire_nb(w, pool);
+    PoolConn *conn = pool_acquire_or_connect(w, pool);
     if (!conn) {
         client->state = CS_WAITING_CONN;
         fd_unwatch(w, client->fd, EL_READABLE);

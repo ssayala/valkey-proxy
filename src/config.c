@@ -66,6 +66,10 @@ void parse_conf(const char *path) {
             g_config.cluster_refresh_interval_ms = atoi(val);
         else if (!strcmp(key, "cluster_node_fail_grace_ms"))
             g_config.cluster_node_fail_grace_ms = atoi(val);
+        else if (!strcmp(key, "worker-cpu-affinity"))
+            g_config.worker_cpu_affinity = (!strcmp(val, "yes"));
+        else if (!strcmp(key, "cpu-affinity-base"))
+            g_config.cpu_affinity_base = atoi(val);
         else if (!strcmp(key, "max_command_size"))
             g_config.max_command_size = atoi(val);
         else if (!strcmp(key, "verbose"))
@@ -176,7 +180,7 @@ int tcp_connect(const char *ip, int port) {
     return tcp_connect_timeout(ip, port, 5000);
 }
 
-int create_tcp_listener(const char *ip, int port) {
+int create_tcp_listener(const char *ip, int port, int reuseport) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("socket");
@@ -184,6 +188,15 @@ int create_tcp_listener(const char *ip, int port) {
     }
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#ifdef SO_REUSEPORT
+    if (reuseport && setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) < 0) {
+        perror("setsockopt(SO_REUSEPORT)");
+        close(fd);
+        return -1;
+    }
+#else
+    (void)reuseport;
+#endif
     set_nonblocking(fd);
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
@@ -198,7 +211,7 @@ int create_tcp_listener(const char *ip, int port) {
         close(fd);
         return -1;
     }
-    if (listen(fd, 128) < 0) {
+    if (listen(fd, SOMAXCONN) < 0) {
         perror("listen");
         close(fd);
         return -1;
@@ -223,7 +236,7 @@ int create_unix_listener(const char *path) {
         close(fd);
         return -1;
     }
-    if (listen(fd, 128) < 0) {
+    if (listen(fd, SOMAXCONN) < 0) {
         perror("listen(unix)");
         close(fd);
         return -1;
