@@ -11,7 +11,6 @@ Requires GCC and (optionally) OpenSSL for TLS support. Supported on Linux, macOS
 ```bash
 make            # build → produces ./valkey-proxy
 make NO_TLS=1   # build without TLS support
-make USE_IOURING=1   # Linux: io_uring I/O for plain-TCP sockets (needs liburing, kernel >= 6.1)
 make clean      # remove binary
 ```
 
@@ -81,13 +80,6 @@ tls-enabled  no
 
 # Unix domain socket (optional)
 # unix-socket  /tmp/valkey-proxy.sock
-
-# io_uring (USE_IOURING=1 builds only; default yes there). Plain-TCP client
-# and backend sockets use io_uring completions instead of epoll + read/write;
-# TLS connections, listeners and legacy pool connections stay on epoll.
-# Measured: ~10% less proxy CPU per request with 1 worker, ~3% with 4 --
-# most of the remaining cost is the kernel TCP stack itself.
-# io-uring  yes
 
 # Close clients idle for more than N seconds (default: 0 = never). As in
 # Valkey, blocked (BLPOP...) and subscribed clients are exempt, and both

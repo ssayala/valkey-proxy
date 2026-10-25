@@ -93,8 +93,3 @@ shutdown-timeout 10               # keep below terminationGracePeriodSeconds
 - **Sizing.** Without client pipelining the proxy uses roughly 4-9 µs of CPU
   per request (similar to what a Valkey node spends), with pipelining well
   under 1 µs. One worker thread covers most sidecars.
-- **io_uring images** (`--build-arg MAKE_FLAGS=USE_IOURING=1`): container
-  runtimes' default seccomp profiles commonly block io_uring; the proxy then
-  logs `io_uring unavailable (Operation not permitted), using epoll` and keeps
-  working. The gain is small (about 10% less CPU per request), so the default
-  image without it is a fine choice.

@@ -24,9 +24,6 @@ void parse_conf(const char *path) {
     g_config.tls_handshake_timeout = 10;
     g_config.shutdown_timeout = 10;
     g_config.tcp_keepalive = 300; /* same default as Valkey */
-#ifdef USE_IOURING
-    g_config.io_uring = 1; /* built in on purpose: on unless "io-uring no" */
-#endif
     char line[512], key[64], val[448];
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
@@ -85,8 +82,6 @@ void parse_conf(const char *path) {
             g_config.client_timeout = atoi(val);
         else if (!strcmp(key, "tls-handshake-timeout"))
             g_config.tls_handshake_timeout = atoi(val);
-        else if (!strcmp(key, "io-uring"))
-            g_config.io_uring = (!strcmp(val, "yes"));
         else if (!strcmp(key, "worker-cpu-affinity"))
             g_config.worker_cpu_affinity = (!strcmp(val, "yes"));
         else if (!strcmp(key, "cpu-affinity-base"))

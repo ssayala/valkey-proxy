@@ -22,8 +22,6 @@ int el_add(EventLoop *el, int fd, int mask);
 void el_del(EventLoop *el, int fd);
 int el_poll(EventLoop *el, int timeout_ms); /* returns nfired */
 const char *el_backend_name(void);
-/* An fd that becomes readable whenever el_poll() would report events (the
- * epoll fd), for nesting this loop inside another; -1 if unsupported. */
-int el_pollable_fd(EventLoop *el);
+
 
 #endif /* EVENT_LOOP_H */

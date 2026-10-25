@@ -164,12 +164,6 @@ static void do_accept(Worker *w, int listen_fd) {
         }
         w->client_map[fd] = client;
         atomic_fetch_add(&w->nclients, 1);
-#ifdef USE_IOURING
-        if (w->ring && !client->ssl) {
-            uring_attach_client(w, client);
-            continue;
-        }
-#endif
         fd_watch(w, fd, EL_READABLE);
     }
 }
@@ -247,9 +241,6 @@ static void *worker_thread(void *arg) {
             fprintf(stderr, "[worker %d] could not set CPU affinity\n", w->thread_id);
     }
 #endif
-#ifdef USE_IOURING
-    if (uring_worker_init(w) == 0 && w->thread_id == 0) printf("I/O: io_uring for plain TCP client/backend sockets\n");
-#endif
     if (w->listen_fd >= 0) fd_watch(w, w->listen_fd, EL_READABLE);
     if (g_unix_fd >= 0) fd_watch(w, g_unix_fd, EL_READABLE);
 
@@ -290,12 +281,6 @@ static void *worker_thread(void *arg) {
 
     db_group_get(w, g_config.db);
 
-#ifdef USE_IOURING
-    if (w->ring) {
-        uring_worker_loop(w);
-        return NULL;
-    }
-#endif
     w->last_sweep = time(NULL);
     while (1) {
         int n = el_poll(w->el, worker_has_ready_backlog(w) ? 0 : worker_sweep_interval_ms());

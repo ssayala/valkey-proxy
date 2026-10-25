@@ -1,10 +1,10 @@
 FROM debian:12 AS build
 
-# e.g. --build-arg MAKE_FLAGS=USE_IOURING=1  (io_uring I/O, Linux >= 6.1 hosts)
+# e.g. --build-arg MAKE_FLAGS=NO_TLS=1
 ARG MAKE_FLAGS=""
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential libssl-dev liburing-dev \
+ && apt-get install -y --no-install-recommends build-essential libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
@@ -14,7 +14,7 @@ RUN make ${MAKE_FLAGS}
 
 FROM debian:12
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libssl3 liburing2 ca-certificates \
+ && apt-get install -y --no-install-recommends libssl3 ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/valkey-proxy /usr/local/bin/valkey-proxy
 COPY proxy.conf /etc/valkey-proxy/proxy.conf

@@ -83,16 +83,6 @@ typedef struct FanoutCtx FanoutCtx;
 typedef struct MuxConn MuxConn;
 typedef struct ConnectJob ConnectJob;
 
-/* One io_uring operation (see src/uring.c). Each connection keeps one for
- * its receive and one for its send; `owner` is NULL once the connection is
- * gone while the kernel still holds the op, which then owns `buf`. */
-typedef struct {
-    int kind;
-    int active; /* submitted, completion not yet seen */
-    void *owner;
-    char *buf; /* send: the buffer being sent (owned); orphaned recv: the target buffer */
-    int len, off, cap;
-} UOp;
 typedef struct Req Req;
 
 /* ── pool connection ────────────────────────────────────────────────── */
@@ -215,8 +205,6 @@ struct MuxConn {
     /* Private connection pinned to one client for WATCH/MULTI (see tx_*()
      * in mux.c); NULL for the shared per-node muxes. */
     ClientConn *pin_client;
-    int uring;      /* I/O via io_uring rather than epoll readiness */
-    UOp *rop, *sop; /* io_uring receive / send */
     int reusable;      /* back to owner->tx_idle once drained */
     int gen;           /* owner->gen at connect; stale once the node moves on */
     MuxConn *idle_next;
@@ -332,8 +320,6 @@ struct ClientConn {
     /* TLS can need the other direction to make progress (a read waiting on
      * writability, or a write on readability); see net_read()/net_write(). */
     int ssl_read_wants_write, ssl_write_wants_read;
-    int uring;      /* I/O via io_uring rather than epoll readiness */
-    UOp *rop, *sop; /* io_uring receive / send */
 };
 
 /* ── fan-out sub-request and context ───────────────────────────────── */
@@ -434,9 +420,6 @@ typedef struct {
     int *fan_slot_sub;
     unsigned *fan_slot_gen;
     unsigned fan_gen;
-    /* io_uring (USE_IOURING builds, "io-uring yes"): NULL = epoll only. */
-    void *ring;
-    uint8_t *uring_fd; /* fds whose I/O goes through the ring, not epoll */
     time_t now;
     time_t last_sweep;
     atomic_int nclients; /* read by main during shutdown */
@@ -478,7 +461,6 @@ typedef struct {
     int unix_socket_perm;      /* chmod for the unix socket, 0 = leave the umask default */
     int tls_handshake_timeout; /* seconds a client gets to finish its TLS handshake */
     int worker_cpu_affinity; /* pin worker i to CPU (cpu_affinity_base + i) */
-    int io_uring;            /* use io_uring for plain-TCP client/backend I/O (USE_IOURING builds) */
     int cpu_affinity_base;
 } Config;
 
@@ -530,16 +512,8 @@ extern SSL_CTX *g_backend_ssl_ctx;
     } while (0)
 
 /* ── event mask helpers ─────────────────────────────────────────────── */
-void worker_want_flush(Worker *w, int fd);
-/* On an io_uring-managed fd (see src/uring.c) there's no epoll registration:
- * the receive is always posted, and "watch writable" -- how the legacy
- * handlers ask for their reply to be written -- means "flush this". */
 static inline void fd_watch(Worker *w, int fd, int events) {
     if (fd < 0 || fd >= g_config.max_connection) return;
-    if (w->uring_fd && w->uring_fd[fd]) {
-        if (events & EL_WRITABLE) worker_want_flush(w, fd);
-        return;
-    }
     uint8_t mask = w->fd_mask[fd] | (uint8_t)events;
     if (mask == w->fd_mask[fd]) return; /* already registered for these: skip the epoll_ctl */
     w->fd_mask[fd] = mask;
@@ -547,7 +521,6 @@ static inline void fd_watch(Worker *w, int fd, int events) {
 }
 static inline void fd_unwatch(Worker *w, int fd, int events) {
     if (fd < 0 || fd >= g_config.max_connection) return;
-    if (w->uring_fd && w->uring_fd[fd]) return;
     uint8_t mask = w->fd_mask[fd] & (uint8_t)~events;
     if (mask == w->fd_mask[fd]) return;
     w->fd_mask[fd] = mask;
@@ -736,21 +709,6 @@ int client_output_drained(Worker *w, ClientConn *client);
 /* Handles a batch of n fired epoll events (valkey-proxy.c). */
 void worker_dispatch_events(Worker *w, int n);
 
-/* ── io_uring (src/uring.c, USE_IOURING builds) ─────────────────────── */
-#ifdef USE_IOURING
-int uring_worker_init(Worker *w); /* 0 = ring ready, -1 = stay on epoll */
-void uring_worker_loop(Worker *w);
-void uring_attach_client(Worker *w, ClientConn *c);
-void uring_detach_client(Worker *w, ClientConn *c);
-void uring_attach_mux(Worker *w, MuxConn *m);
-void uring_detach_mux(Worker *w, MuxConn *m);
-void uring_client_recv(Worker *w, ClientConn *c);
-int uring_client_send(Worker *w, ClientConn *c); /* -1 if c was closed */
-void uring_mux_send(Worker *w, MuxConn *m);
-int client_on_recv(Worker *w, ClientConn *c, int n);
-int client_recv_reserve(ClientConn *c);
-int mux_on_recv(Worker *w, MuxConn *m, int n);
-#endif
 /* Backend connection lost: every request on m gets an error reply, in
  * order, and m is freed. */
 void mux_fail(Worker *w, MuxConn *m, const char *msg);
