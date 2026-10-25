@@ -3,6 +3,11 @@
 
 #define EL_READABLE 1
 #define EL_WRITABLE 2
+/* Only in fired masks, alongside EL_READABLE: the peer has closed (or shut
+ * down its sending side), so a short read doesn't mean "drained" -- keep
+ * reading until EOF. Backends that can't tell report it on every readable
+ * event, which just means always reading until EAGAIN. */
+#define EL_HANGUP 4
 
 typedef struct {
     int fd;

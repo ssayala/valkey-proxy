@@ -68,7 +68,7 @@ static int el_api_poll(EventLoop *el, int timeout_ms) {
     for (int i = 0; i < n; i++) {
         el->fired[i].fd = (int)s->evbuf[i].ident;
         el->fired[i].mask = 0;
-        if (s->evbuf[i].filter == EVFILT_READ) el->fired[i].mask |= EL_READABLE;
+        if (s->evbuf[i].filter == EVFILT_READ) el->fired[i].mask |= EL_READABLE | EL_HANGUP;
         if (s->evbuf[i].filter == EVFILT_WRITE) el->fired[i].mask |= EL_WRITABLE;
     }
     return n;

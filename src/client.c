@@ -17,6 +17,7 @@ void client_send_crossslot(ClientConn *client) {
 
 void close_client(Worker *w, ClientConn *client) {
     int fd = client->fd;
+    client->closing = 1;
     w->close_seq++;
     atomic_fetch_sub(&w->nclients, 1);
     client_list_unlink(w, client);

@@ -159,6 +159,38 @@ void run_pipeline_tests(const char *host, int port, int *pass, int *fail) {
     resp_next_str(fd, r, sizeof(r));
     CHECK(!strcmp(r, "+PONG"), "PING after fan-out", pass, fail);
 
+    /* ── replies stay in order around one-at-a-time (legacy) commands ──── */
+    {
+        static const char *LEGACY[][3] = {{"DBSIZE", NULL, NULL},     {"OBJECT", "ENCODING", "tc:pl:7"},
+                                          {"KEYS", "tc:pl:7", NULL},  {"TIME", NULL, NULL},
+                                          {"INFO", "server", NULL},   {"COMMAND", "COUNT", NULL}};
+        int ok = 1;
+        for (size_t i = 0; i < sizeof(LEGACY) / sizeof(LEGACY[0]); i++) {
+            b.len = 0;
+            pb_cmd(&b, 1, "PING");
+            if (!LEGACY[i][1])
+                pb_cmd(&b, 1, LEGACY[i][0]);
+            else if (!LEGACY[i][2])
+                pb_cmd(&b, 2, LEGACY[i][0], LEGACY[i][1]);
+            else
+                pb_cmd(&b, 3, LEGACY[i][0], LEGACY[i][1], LEGACY[i][2]);
+            pb_cmd(&b, 2, "ECHO", "after");
+            pb_cmd(&b, 2, "GET", "tc:pl:7");
+            write_all(fd, b.buf, b.len, b.len);
+            char raw[65536];
+            resp_next_str(fd, r, sizeof(r));
+            int this_ok = !strcmp(r, "+PONG");
+            this_ok = this_ok && read_raw_reply(fd, raw, sizeof(raw)) > 0; /* the legacy command's reply */
+            resp_next_str(fd, r, sizeof(r));
+            this_ok = this_ok && !strcmp(r, "after");
+            resp_next_str(fd, r, sizeof(r));
+            this_ok = this_ok && !strcmp(r, "v7");
+            if (!this_ok) printf("    out of order around %s\n", LEGACY[i][0]);
+            ok = ok && this_ok;
+        }
+        CHECK(ok, "pipelined replies stay in order around one-at-a-time commands", pass, fail);
+    }
+
     /* ── protocol error queued behind an in-flight reply ───────────────── */
     b.len = 0;
     pb_cmd(&b, 2, "GET", "tc:pl:7");

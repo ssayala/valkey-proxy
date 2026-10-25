@@ -9,6 +9,14 @@ POOL_CFLAGS  += -DUSE_TLS -I$(OPENSSL_PREFIX)/include
 POOL_LDFLAGS += -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
 endif
 
+# Sanitizer builds for testing (always "make clean" when switching):
+#   make SANITIZE=address,undefined    memory errors, leaks, undefined behavior
+#   make SANITIZE=thread               data races between threads
+ifneq ($(SANITIZE),)
+POOL_CFLAGS  := $(filter-out -O2,$(POOL_CFLAGS)) -O1 -g -fno-omit-frame-pointer -fsanitize=$(SANITIZE)
+POOL_LDFLAGS += -fsanitize=$(SANITIZE)
+endif
+
 POOL_TARGET = valkey-proxy
 POOL_SRCS   = src/valkey-proxy.c src/config.c src/cluster.c src/resp.c \
               src/pool.c src/cmd.c src/fanout.c src/pubsub.c src/acl.c src/client.c \

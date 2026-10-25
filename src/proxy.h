@@ -191,6 +191,7 @@ struct MuxConn {
     int node_idx, db, resp;
     int connecting; /* non-blocking connect() still in progress */
     int tls_hs;     /* TLS handshake in progress (after connect) */
+    int peer_closed; /* EL_HANGUP seen: read until EOF, a short read isn't "drained" */
     int ssl_read_wants_write;
     int draining;   /* node identity moved on: no new requests, close once idle */
     struct NodePools *owner;
@@ -236,6 +237,9 @@ struct ClientConn {
     int ibuf_len, ibuf_off, ibuf_cap;
     int ibuf_need;   /* bytes the next, still-incomplete command needs */
     int read_paused; /* stopped reading: too much unparsed input buffered */
+    int peer_closed; /* EL_HANGUP seen: read until EOF, a short read isn't "drained" */
+    int eof;         /* read EOF: finish what's already buffered, then close */
+    int closing;     /* inside close_client() */
     /* Fast-path requests not yet answered to the client, in command order. */
     Req *rq_head, *rq_tail;
     int rq_count;
@@ -521,6 +525,11 @@ static inline void fd_watch(Worker *w, int fd, int events) {
 }
 static inline void fd_unwatch(Worker *w, int fd, int events) {
     if (fd < 0 || fd >= g_config.max_connection) return;
+    /* Client sockets stay readable-watched for their whole life: input that
+     * arrives while a legacy command runs is only buffered (see
+     * client_process_input()), and a hang-up must be noticed even then. The
+     * legacy handlers' "stop reading" calls are therefore ignored. */
+    if ((events & EL_READABLE) && w->client_map[fd] && !w->client_map[fd]->closing) events &= ~EL_READABLE;
     uint8_t mask = w->fd_mask[fd] & (uint8_t)~events;
     if (mask == w->fd_mask[fd]) return;
     w->fd_mask[fd] = mask;

@@ -69,7 +69,7 @@ static int el_api_poll(EventLoop *el, int timeout_ms) {
         int fd = (int)(uintptr_t)s->evbuf[i].portev_user;
         el->fired[i].fd = fd;
         el->fired[i].mask = 0;
-        if (s->evbuf[i].portev_events & POLLIN) el->fired[i].mask |= EL_READABLE;
+        if (s->evbuf[i].portev_events & POLLIN) el->fired[i].mask |= EL_READABLE | EL_HANGUP;
         if (s->evbuf[i].portev_events & POLLOUT) el->fired[i].mask |= EL_WRITABLE;
         /* evport is oneshot — re-associate for next poll */
         if (fd < FD_SETSIZE && s->masks[fd])

@@ -189,6 +189,7 @@ void worker_dispatch_events(Worker *w, int n) {
         if (fd < 0 || fd >= g_config.max_connection) continue;
         if (w->client_map[fd]) {
             ClientConn *cl = w->client_map[fd];
+            if (mask & EL_HANGUP) cl->peer_closed = 1;
             if (mask & EL_READABLE) handle_client_readable(w, cl);
             if (cl == w->client_map[fd] && (mask & EL_WRITABLE)) handle_client_writable(w, cl);
         } else if (w->backend_map[fd]) {
@@ -203,6 +204,7 @@ void worker_dispatch_events(Worker *w, int n) {
                 handle_backend_readable(w, pc);
         } else if (w->mux_map[fd]) {
             MuxConn *m = w->mux_map[fd];
+            if (mask & EL_HANGUP) m->peer_closed = 1;
             if (mask & EL_WRITABLE) handle_mux_writable(w, m);
             if (m == w->mux_map[fd] && (mask & EL_READABLE)) handle_mux_readable(w, m);
         }

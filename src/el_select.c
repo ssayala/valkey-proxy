@@ -47,7 +47,7 @@ static int el_api_poll(EventLoop *el, int timeout_ms) {
     int nfired = 0;
     for (int fd = 0; fd <= s->maxfd && nfired < el->max_events; fd++) {
         int mask = 0;
-        if (FD_ISSET(fd, &rfds)) mask |= EL_READABLE;
+        if (FD_ISSET(fd, &rfds)) mask |= EL_READABLE | EL_HANGUP;
         if (FD_ISSET(fd, &wfds)) mask |= EL_WRITABLE;
         if (mask) {
             el->fired[nfired].fd = fd;

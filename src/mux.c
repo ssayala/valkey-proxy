@@ -157,6 +157,21 @@ static void client_out_append(Worker *w, ClientConn *c, const char *data, int le
     pw_add(w, c);
 }
 
+/* A legacy command (legacy_dispatch()) hasn't finished: some of them wait
+ * on fan-out sub-requests or a pool connection without leaving
+ * CS_READING_HDR, so the state alone doesn't tell. Nothing else of the
+ * client's may start meanwhile, or its reply would overtake this one. */
+static int client_legacy_busy(const ClientConn *c) {
+    return c->state != CS_READING_HDR || c->fanout_ctx || c->pending_conn || c->hello_auth_conn;
+}
+
+/* Blocked in BLPOP & co, or subscribed: what such a client waits on can
+ * last forever, so if it hangs up it's closed at once (as Valkey does). */
+static int client_parked(const ClientConn *c) {
+    return (c->pending_conn && c->pending_conn->pool && c->pending_conn->pool->type == POOL_BLOCKING) || c->sub_conn ||
+           c->in_subscribe;
+}
+
 /* Reply bytes not yet written to the socket. */
 static int client_out_bytes(const ClientConn *c) {
     return c->wbuf_len - c->wbuf_off;
@@ -686,8 +701,9 @@ void handle_mux_readable(Worker *w, MuxConn *m) {
         m->rbuf_len += (int)n;
         if (mux_parse_replies(w, m) < 0) return;
         /* Plain TCP: a short read means the socket is drained (edge-
-         * triggered, so nothing more until the next edge). */
-        if (n < space && net_short_read_drained(m->ssl)) break;
+         * triggered, so nothing more until the next edge) -- unless the peer
+         * hung up, whose EOF then has to be read now. */
+        if (n < space && net_short_read_drained(m->ssl) && !m->peer_closed) break;
     }
     if (m->obuf_off < m->obuf_len) pf_add(w, m); /* a TLS write may have been waiting on this read */
     if (m->draining && m->inflight == 0) mux_drained(w, m);
@@ -1488,7 +1504,7 @@ static void local_reply(Worker *w, ClientConn *c, const char *cmd, const char *p
 void client_process_input(Worker *w, ClientConn *c) {
     int fd = c->fd;
     int incomplete = 0;
-    while (!c->close_asap && !c->close_after_write && c->state == CS_READING_HDR) {
+    while (!c->close_asap && !c->close_after_write && !client_legacy_busy(c)) {
         int avail = c->ibuf_len - c->ibuf_off;
         if (avail <= 0) break;
         const char *p = c->ibuf + c->ibuf_off;
@@ -1633,6 +1649,19 @@ void client_process_input(Worker *w, ClientConn *c) {
 
     if (c->ibuf_off == c->ibuf_len) c->ibuf_off = c->ibuf_len = 0;
     if (!incomplete) c->ibuf_need = 0;
+    if (c->eof && !c->close_after_write && !c->close_asap) {
+        if (client_parked(c)) {
+            c->close_asap = 1; /* nothing it waits for is worth keeping it */
+            pw_add(w, c);
+        } else if (c->ibuf_len == c->ibuf_off || incomplete) {
+            /* Everything the client sent before hanging up has been started
+             * (a trailing partial command can never complete): close once
+             * the replies in flight are done -- or fail to write. */
+            c->close_after_write = 1;
+            c->read_paused = 0;
+            pw_add(w, c);
+        }
+    }
     if ((c->ibuf_len > c->ibuf_off && !incomplete) || c->read_paused)
         bl_add(w, c);
     else
@@ -1720,12 +1749,16 @@ void handle_client_readable(Worker *w, ClientConn *c) {
             return;
         }
         if (n == 0) {
-            close_client(w, c);
-            return;
+            /* Like Valkey: commands that arrived with the hang-up still
+             * run; client_process_input() closes once nothing's left. */
+            c->eof = 1;
+            break;
         }
         c->ibuf_len += (int)n;
         c->last_interaction = w->now;
-        if (n < space && net_short_read_drained(c->ssl)) break;
+        /* A short read means drained, unless the peer has hung up: then the
+         * EOF behind the data gets no event of its own. */
+        if (n < space && net_short_read_drained(c->ssl) && !c->peer_closed) break;
     }
     c->read_paused = 0;
     client_process_input(w, c);
@@ -1736,10 +1769,6 @@ void handle_client_readable(Worker *w, ClientConn *c) {
 /* All output is on the wire: deferred close, or the end of a legacy reply.
  * Returns -1 if c was closed. */
 int client_output_drained(Worker *w, ClientConn *c) {
-    if (c->close_after_write && !c->rq_head) { /* the error reply may still be queued behind in-flight ones */
-        close_client(w, c);
-        return -1;
-    }
     if (c->state == CS_WRITING_RESP) {
         /* A legacy reply just finished going out. */
         c->state = CS_READING_HDR;
@@ -1747,6 +1776,14 @@ int client_output_drained(Worker *w, ClientConn *c) {
         c->using_pbuf = 0;
         c->pbuf_len = 0;
         fd_watch(w, c->fd, EL_READABLE);
+    }
+    /* Deferred close (protocol error, or the client hung up): only once
+     * every reply it's owed has gone out -- the error reply may still be
+     * queued behind in-flight ones, and a legacy command may still be
+     * running (unless it's one that can wait forever). */
+    if (c->close_after_write && !c->rq_head && (!client_legacy_busy(c) || client_parked(c))) {
+        close_client(w, c);
+        return -1;
     }
     return 0;
 }
@@ -1784,7 +1821,7 @@ int client_flush(Worker *w, ClientConn *c) {
 static int client_input_ready(ClientConn *c) {
     if (c->close_asap || c->close_after_write) return 0;
     if (c->read_paused) return c->ibuf_len - c->ibuf_off < CLIENT_READ_PAUSE;
-    return c->state == CS_READING_HDR && !c->rq_head && client_out_bytes(c) == 0;
+    return !client_legacy_busy(c) && !c->rq_head && client_out_bytes(c) == 0;
 }
 
 static void process_backlog(Worker *w) {

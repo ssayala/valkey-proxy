@@ -36,7 +36,7 @@ static int el_api_add(EventLoop *el, int fd, int mask) {
     struct epoll_event ev;
     ev.data.fd = fd;
     ev.events = EPOLLET;
-    if (mask & EL_READABLE) ev.events |= EPOLLIN;
+    if (mask & EL_READABLE) ev.events |= EPOLLIN | EPOLLRDHUP;
     if (mask & EL_WRITABLE) ev.events |= EPOLLOUT;
     if (epoll_ctl(s->epfd, EPOLL_CTL_MOD, fd, &ev) < 0) return epoll_ctl(s->epfd, EPOLL_CTL_ADD, fd, &ev);
     return 0;
@@ -56,6 +56,7 @@ static int el_api_poll(EventLoop *el, int timeout_ms) {
         el->fired[i].fd = s->evbuf[i].data.fd;
         el->fired[i].mask = 0;
         if (e & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) el->fired[i].mask |= EL_READABLE;
+        if (e & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) el->fired[i].mask |= EL_HANGUP;
         if (e & (EPOLLOUT | EPOLLERR | EPOLLHUP)) el->fired[i].mask |= EL_WRITABLE;
     }
     return n;
