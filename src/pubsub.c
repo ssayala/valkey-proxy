@@ -182,7 +182,7 @@ void handle_blocking_complete(Worker *w, ClientConn *client, const char *cmd) {
     int slot = key_slot(kp[0], kl[0]);
     for (int i = 1; i < nkeys; i++) {
         if (key_slot(kp[i], kl[i]) != slot) {
-            client_send_crossslot(client);
+            client_send_crossslot(w, client);
             client->pbuf_len = 0;
             client->hbuf_len = 0;
             client->using_pbuf = 0;

@@ -89,6 +89,31 @@ static void pf_remove(Worker *w, MuxConn *m) {
     m->pf_prev = m->pf_next = NULL;
 }
 
+static void ct_add(Worker *w, MuxConn *m) {
+    if (m->in_ct) return;
+    m->in_ct = 1;
+    m->ct_prev = NULL;
+    m->ct_next = w->ct_head;
+    if (w->ct_head) w->ct_head->ct_prev = m;
+    w->ct_head = m;
+}
+static void ct_remove(Worker *w, MuxConn *m) {
+    if (!m->in_ct) return;
+    if (m->ct_prev)
+        m->ct_prev->ct_next = m->ct_next;
+    else
+        w->ct_head = m->ct_next;
+    if (m->ct_next) m->ct_next->ct_prev = m->ct_prev;
+    m->in_ct = 0;
+    m->ct_prev = m->ct_next = NULL;
+}
+
+static long long mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 void client_list_unlink(Worker *w, ClientConn *c) {
     pw_remove(w, c);
     bl_remove(w, c);
@@ -144,6 +169,8 @@ static int buf_reserve(char **buf, int *len, int *off, int *cap, int need) {
     return 0;
 }
 
+void client_queue_reply(Worker *w, ClientConn *c, const char *data, int len);
+
 static void client_out_append(Worker *w, ClientConn *c, const char *data, int len) {
     if (c->close_asap) return;
     if (c->wbuf_off == c->wbuf_len) c->wbuf_off = c->wbuf_len = 0;
@@ -175,6 +202,10 @@ static int client_parked(const ClientConn *c) {
 /* Reply bytes not yet written to the socket. */
 static int client_out_bytes(const ClientConn *c) {
     return c->wbuf_len - c->wbuf_off;
+}
+
+void client_queue_reply(Worker *w, ClientConn *c, const char *data, int len) {
+    client_out_append(w, c, data, len);
 }
 
 /* ── reply ordering ─────────────────────────────────────────────────── */
@@ -323,6 +354,7 @@ static void tx_reset(ClientConn *c);
 
 static void mux_destroy(Worker *w, MuxConn *m) {
     pf_remove(w, m);
+    ct_remove(w, m);
     if (m->owner) {
         for (int i = 0; i < 2; i++) {
             if (m->owner->mux[i] == m) m->owner->mux[i] = NULL;
@@ -373,9 +405,15 @@ void mux_fail(Worker *w, MuxConn *m, const char *msg) {
     mux_destroy(w, m);
 }
 
-static void mux_enqueue(Worker *w, MuxConn *m, Req *r, const char *data, int len) {
+/* Room for len more bytes of output on m; -1 on OOM. After a successful
+ * reserve, the next mux_enqueue() of up to len bytes can't fail. */
+static int mux_reserve(MuxConn *m, int len) {
     if (m->obuf_off == m->obuf_len) m->obuf_off = m->obuf_len = 0;
-    if (buf_reserve(&m->obuf, &m->obuf_len, &m->obuf_off, &m->obuf_cap, len) < 0) {
+    return buf_reserve(&m->obuf, &m->obuf_len, &m->obuf_off, &m->obuf_cap, len);
+}
+
+static void mux_enqueue(Worker *w, MuxConn *m, Req *r, const char *data, int len) {
+    if (mux_reserve(m, len) < 0) {
         /* Can't buffer the command: fail just this request. */
         req_deliver(w, r, "-ERR out of memory\r\n", 20);
         return;
@@ -405,11 +443,23 @@ static void mux_drained(Worker *w, MuxConn *m) {
     mux_destroy(w, m);
 }
 
-static void mux_internal_cmd(Worker *w, MuxConn *m, const char *cmd, int len) {
+/* Queues a command whose reply the proxy consumes itself. setup: part of
+ * establishing the connection (HELLO 3, SELECT, AUTH) -- if the backend
+ * rejects it the connection is unusable (wrong db / protocol / user), so it
+ * fails instead (see mux_parse_replies()). If the command can't even be
+ * queued, m fails right here (it must not carry on without it -- e.g. a
+ * transaction without its MULTI) and -1 is returned: m is gone. */
+static int mux_internal_cmd(Worker *w, MuxConn *m, const char *cmd, int len, int setup) {
     Req *r = req_new(w);
-    if (!r) return;
+    if (!r || mux_reserve(m, len) < 0) {
+        if (r) req_free(w, r);
+        mux_fail(w, m, "out of memory");
+        return -1;
+    }
     r->internal = 1;
+    r->setup = setup;
     mux_enqueue(w, m, r, cmd, len);
+    return 0;
 }
 
 static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
@@ -458,18 +508,22 @@ static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
     /* Writable fires once connect() completes; the TLS handshake (if any)
      * starts from there, and queued commands are flushed after it. */
         fd_watch(w, fd, EL_READABLE | (m->connecting || m->tls_hs ? EL_WRITABLE : 0));
+    if (m->connecting || m->tls_hs) {
+        m->connect_deadline = mono_ms() + g_config.backend_connect_timeout_ms;
+        ct_add(w, m);
+    }
 
     /* Connection setup rides the same pipeline as the first real commands;
      * these replies are swallowed (see req_deliver()). */
     if (resp == 3) {
         static const char HELLO3[] = "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n";
-        mux_internal_cmd(w, m, HELLO3, (int)sizeof(HELLO3) - 1);
+        if (mux_internal_cmd(w, m, HELLO3, (int)sizeof(HELLO3) - 1, 1) < 0) return NULL;
     }
     if (db != 0) {
         char dbs[16], sel[64];
         int dl = snprintf(dbs, sizeof(dbs), "%d", db);
         int n = snprintf(sel, sizeof(sel), "*2\r\n$6\r\nSELECT\r\n$%d\r\n%s\r\n", dl, dbs);
-        mux_internal_cmd(w, m, sel, n);
+        if (mux_internal_cmd(w, m, sel, n, 1) < 0) return NULL;
     }
     LOG_VERBOSE("[worker %d] [mux] connect fd=%d node=%s:%d db=%d resp=%d\n", w->thread_id, fd, nd->ip, nd->port, db,
                 resp);
@@ -535,6 +589,7 @@ static int mux_tls_step(Worker *w, MuxConn *m) {
         return 0;
     }
     m->tls_hs = 0;
+    ct_remove(w, m);
     if (g_config.verbose) {
         char d[128];
         printf("[worker %d] [mux] fd=%d TLS %s\n", w->thread_id, m->fd, tls_describe(m->ssl, d, sizeof(d)));
@@ -557,6 +612,7 @@ void handle_mux_writable(Worker *w, MuxConn *m) {
             return;
         }
         m->connecting = 0;
+        if (!m->tls_hs) ct_remove(w, m);
     }
     if (m->tls_hs) {
         if (mux_tls_step(w, m) < 0 || m->tls_hs) return;
@@ -630,7 +686,7 @@ static int mux_try_redirect(Worker *w, MuxConn *m, Req *r, const char *d, int le
     if (!t) return 0;
     if (ask) {
         static const char ASKING[] = "*1\r\n$6\r\nASKING\r\n";
-        mux_internal_cmd(w, t, ASKING, (int)sizeof(ASKING) - 1);
+        if (mux_internal_cmd(w, t, ASKING, (int)sizeof(ASKING) - 1, 0) < 0) return 0;
     }
     r->redirects++;
     LOG_VERBOSE("[worker %d] %s slot %d -> %s:%d\n", w->thread_id, ask ? "ASK" : "MOVED", slot,
@@ -662,6 +718,13 @@ static int mux_parse_replies(Worker *w, MuxConn *m) {
         r->mnext = NULL;
         const char *reply = m->rbuf + m->rbuf_off;
         m->rbuf_off += rl;
+        if (reply[0] == '-' && r->setup) {
+            char msg[200];
+            snprintf(msg, sizeof(msg), "backend rejected connection setup: %.*s", rl > 2 ? rl - 3 : 0, reply + 1);
+            req_free(w, r);
+            mux_fail(w, m, msg);
+            return -1;
+        }
         if (reply[0] == '-' && !r->internal && !m->pin_client && mux_try_redirect(w, m, r, reply, rl)) continue;
         req_deliver(w, r, reply, rl);
     }
@@ -740,7 +803,9 @@ void fanout_send_sub(Worker *w, FanoutSub *sub, const char *cmd, int len) {
     MuxConn *m = (sub->node_idx >= 0 && sub->node_idx < w->topo.node_count)
                      ? mux_for_db(w, sub->ctx->client->db, sub->node_idx, 2)
                      : NULL;
-    Req *r = m ? req_new(w) : NULL;
+    /* Reserve first so mux_enqueue() can't fail: its failure path would
+     * complete (and possibly aggregate) the sub synchronously. */
+    Req *r = (m && mux_reserve(m, len) == 0) ? req_new(w) : NULL;
     if (!r) {
         /* Not sub_deliver(): callers are still looping over ctx->subs and
          * aggregate themselves once ndone == nsubs after the loop. */
@@ -1000,10 +1065,9 @@ static MuxConn *tx_pin(Worker *w, ClientConn *c, int node_idx) {
             int al[3] = {4, c->acl_userlen, c->acl_passlen};
             int n;
             char *auth = build_resp_cmd(a[0], al[0], a + 1, al + 1, 2, &n);
-            if (auth) {
-                mux_internal_cmd(w, m, auth, n);
-                free(auth);
-            }
+            int rc = auth ? mux_internal_cmd(w, m, auth, n, 1) : (mux_fail(w, m, "out of memory"), -1);
+            free(auth);
+            if (rc < 0) return NULL;
         }
     }
     m->pin_client = c;
@@ -1014,6 +1078,10 @@ static MuxConn *tx_pin(Worker *w, ClientConn *c, int node_idx) {
 }
 
 static void tx_forward(Worker *w, ClientConn *c, const char *p, int len) {
+    if (!c->pin) { /* pinned connection failed while setting up (see mux_internal_cmd()) */
+        client_reply_error(w, c, "backend connection error");
+        return;
+    }
     Req *r = client_req_new(w, c);
     if (!r) return;
     r->inflight_kind = 2;
@@ -1060,6 +1128,15 @@ static int tx_handle(Worker *w, ClientConn *c, const char *cmd, const CmdInfo *c
     int is_multi = !strcmp(cmd, "MULTI"), is_exec = !strcmp(cmd, "EXEC"), is_discard = !strcmp(cmd, "DISCARD"),
         is_watch = !strcmp(cmd, "WATCH"), is_unwatch = !strcmp(cmd, "UNWATCH");
     int txn_cmd = is_multi || is_exec || is_discard || is_watch || is_unwatch;
+    if (c->tx_state == 1 && (!strcmp(cmd, "SELECT") || !strcmp(cmd, "AUTH") || !strcmp(cmd, "HELLO"))) {
+        /* WATCH pinned a connection with the current db / protocol / user;
+         * changing them now would run the transaction with the old ones. */
+        char e[160];
+        snprintf(e, sizeof(e), "-ERR '%.16s' is not supported while WATCH is active by the proxy (UNWATCH first)\r\n",
+                 cmd);
+        client_reply_str(w, c, e);
+        return 1;
+    }
     if (c->tx_state < 2 && !txn_cmd) return 0; /* between WATCH and MULTI: route normally */
     if (c->shared_inflight > 0) return 2;
 
@@ -1172,7 +1249,7 @@ static int tx_handle(Worker *w, ClientConn *c, const char *cmd, const CmdInfo *c
         return 1;
     }
     if (c->tx_dirty) {
-        if (c->pin) mux_internal_cmd(w, c->pin, "*1\r\n$7\r\nDISCARD\r\n", 17);
+        if (c->pin) mux_internal_cmd(w, c->pin, "*1\r\n$7\r\nDISCARD\r\n", 17, 0); /* failure drops the pin */
         client_reply_str(w, c, "-EXECABORT Transaction discarded because of previous errors.\r\n");
         tx_end(w, c);
         return 1;
@@ -1199,17 +1276,23 @@ send_multi_and_queue:
     /* c->pin was just chosen: replay MULTI and the locally-answered keyless
      * commands (their replies were already sent, so they're swallowed), then
      * forward the current command. */
-    mux_internal_cmd(w, c->pin, "*1\r\n$5\r\nMULTI\r\n", 15);
-    for (int off = 0; off < c->txq_len;) {
+    int ok = mux_internal_cmd(w, c->pin, "*1\r\n$5\r\nMULTI\r\n", 15, 0) == 0;
+    for (int off = 0; ok && off < c->txq_len;) {
         const char *q = c->txq + off;
         const char *cp2, *kp2;
         int cl2, kl2, argc2;
         long long tot2, need2;
         if (scan_command(q, c->txq_len - off, &cp2, &cl2, &kp2, &kl2, &argc2, &tot2, &need2) != 1) break;
-        mux_internal_cmd(w, c->pin, q, (int)tot2);
+        ok = mux_internal_cmd(w, c->pin, q, (int)tot2, 0) == 0;
         off += (int)tot2;
     }
     c->txq_len = 0;
+    if (!ok) {
+        /* The pinned connection failed (which ended the transaction): this
+         * command can't run as part of it. */
+        client_reply_error(w, c, "backend connection error");
+        return 1;
+    }
     tx_forward(w, c, p, len);
     if (is_exec) tx_end(w, c);
     return 1;
@@ -1858,7 +1941,23 @@ void worker_after_events(Worker *w) {
 }
 
 /* ── timeouts ─────────────────────────────────────────────────────────── */
-int worker_sweep_interval_ms(void) {
+void mux_check_connect_timeouts(Worker *w) {
+    if (!w->ct_head) return;
+    long long now = mono_ms();
+    for (MuxConn *m = w->ct_head; m;) {
+        if (now < m->connect_deadline) {
+            m = m->ct_next;
+            continue;
+        }
+        /* Failing m replies to its requests, which can close clients and,
+         * through them, other muxes: restart from the head. */
+        mux_fail(w, m, m->connecting ? "backend connect timeout" : "backend TLS handshake timeout");
+        m = w->ct_head;
+    }
+}
+
+int worker_sweep_interval_ms(Worker *w) {
+    if (w->ct_head) return 100; /* connect deadlines pending */
     if (atomic_load_explicit(&g_shutdown, memory_order_relaxed)) return 100;
     return (g_config.client_timeout > 0 || (g_config.tls_enabled && g_config.tls_handshake_timeout > 0)) ? 1000 : -1;
 }
@@ -1882,7 +1981,7 @@ void worker_sweep_clients(Worker *w) {
             continue;
         }
         if (idle <= 0 || w->now - c->last_interaction <= idle) continue; /* Valkey: idle > timeout */
-        if (c->state != CS_READING_HDR || c->rq_head || c->in_subscribe || c->sub_conn || client_out_bytes(c) > 0)
+        if (client_legacy_busy(c) || c->rq_head || c->in_subscribe || c->sub_conn || client_out_bytes(c) > 0)
             continue;
         LOG_VERBOSE("[worker %d] closing %s: idle for %lds\n", w->thread_id, c->addr, (long)(w->now - c->last_interaction));
         close_client(w, c);
@@ -1910,7 +2009,7 @@ void worker_drain(Worker *w) {
         /* Subscribers never go quiet on their own: let them reconnect
          * elsewhere. Everyone else first gets every reply it's owed. */
         int subscribed = c->in_subscribe || c->sub_conn;
-        if (!subscribed && (c->state != CS_READING_HDR || c->rq_head || c->tx_state || c->ibuf_len > c->ibuf_off))
+        if (!subscribed && (client_legacy_busy(c) || c->rq_head || c->tx_state || c->ibuf_len > c->ibuf_off))
             continue;
         if (client_out_bytes(c) > 0) continue;
         close_client(w, c);

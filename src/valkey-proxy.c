@@ -276,11 +276,12 @@ static void *worker_thread(void *arg) {
 
     w->last_sweep = time(NULL);
     while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
-        int n = el_poll(w->el, worker_has_ready_backlog(w) ? 0 : worker_sweep_interval_ms());
+        int n = el_poll(w->el, worker_has_ready_backlog(w) ? 0 : worker_sweep_interval_ms(w));
         if (n < 0) break;
         w->now = time(NULL);
         if (w->topology_version_seen != topology_version_load()) worker_sync_topology(w);
         worker_dispatch_events(w, n);
+        mux_check_connect_timeouts(w);
         worker_after_events(w);
         worker_sweep_clients(w);
         if (atomic_load_explicit(&g_shutdown, memory_order_relaxed)) worker_drain(w);

@@ -368,8 +368,11 @@ static void reconcile_and_publish(ClusterNode *dn, int dcount, int *dslot, const
         }
         if (idx >= 0) {
             matched_old[idx] = 1;
+            /* The resolved address counts too: a node announced by hostname
+             * can come back (same name, same node-id) on a new IP. */
             int addr_changed = strcmp(nodes[idx].node_id, dn[j].node_id) != 0 || strcmp(nodes[idx].ip, dn[j].ip) != 0 ||
-                               nodes[idx].port != dn[j].port;
+                               nodes[idx].port != dn[j].port || nodes[idx].salen != dn[j].salen ||
+                               memcmp(&nodes[idx].sa, &dn[j].sa, dn[j].salen) != 0;
             nodes[idx] = dn[j];
             nodes[idx].is_master = 1;
             if (addr_changed) {

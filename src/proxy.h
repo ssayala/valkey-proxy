@@ -175,6 +175,7 @@ struct Req {
     int done;           /* reply arrived (held in reply[]) before earlier ones */
     int internal;
     int inflight_kind;  /* 1 = counted in client->shared_inflight, 2 = pin_inflight */
+    int setup;          /* internal connection-setup command (see mux_internal_cmd()) */
     char *reply;
     int reply_len;
     /* Copy of the command, kept so a MOVED/ASK reply can be retried on the
@@ -193,6 +194,11 @@ struct MuxConn {
     int tls_hs;     /* TLS handshake in progress (after connect) */
     int peer_closed; /* EL_HANGUP seen: read until EOF, a short read isn't "drained" */
     int ssl_read_wants_write;
+    /* While connecting / in the TLS handshake: on the worker's ct list, and
+     * failed if not done by connect_deadline (see mux_check_connect_timeouts()). */
+    long long connect_deadline;
+    MuxConn *ct_prev, *ct_next;
+    int in_ct;
     int draining;   /* node identity moved on: no new requests, close once idle */
     struct NodePools *owner;
     char *obuf;
@@ -340,7 +346,7 @@ struct FanoutSub {
 
 struct FanoutCtx {
     ClientConn *client;
-    char cmd[16];
+    char cmd[32];
     int nsubs, ndone, had_error;
     /* Sized per command by fanout_ctx_new() (same allocation as the ctx). */
     FanoutSub *subs;
@@ -418,6 +424,7 @@ typedef struct {
     MuxConn *pf_head;   /* muxes with unsent output */
     ClientConn *pw_head; /* clients with unsent output */
     ClientConn *bl_head; /* clients with buffered, unprocessed input */
+    MuxConn *ct_head;    /* muxes still connecting (connect deadline pending) */
     unsigned close_seq;  /* bumped by close_client() */
     /* Slot -> sub-request index scratch for pipelined fan-out, valid where
      * fan_slot_gen[slot] == fan_gen (avoids clearing 16K entries per call). */
@@ -683,7 +690,10 @@ void client_send_error(Worker *w, ClientConn *client, const char *msg);
 /* The proxy-side address of client's connection, looked up on first use
  * (only CLIENT INFO needs it, so accept() doesn't pay a getsockname()). */
 const char *client_laddr(ClientConn *client);
-void client_send_crossslot(ClientConn *client);
+void client_send_crossslot(Worker *w, ClientConn *client);
+void client_send_wrong_arity(Worker *w, ClientConn *client, const char *cmd);
+/* Queue a reply (in order, after anything already queued) for the client. */
+void client_queue_reply(Worker *w, ClientConn *client, const char *data, int len);
 void close_client(Worker *w, ClientConn *client);
 void resume_client_after_conn(Worker *w, ClientConn *client, PoolConn *conn);
 void client_recover_after_backend_error(Worker *w, ClientConn *client, PoolConn *conn, const char *msg);
@@ -733,7 +743,10 @@ void worker_sweep_clients(Worker *w);
 /* After SIGTERM: stop accepting, then close each client once it has
  * nothing in flight (see main()). */
 void worker_drain(Worker *w);
-int worker_sweep_interval_ms(void);
+int worker_sweep_interval_ms(Worker *w);
+/* Fails backend connections whose connect + TLS handshake has taken longer
+ * than backend_connect_timeout_ms. */
+void mux_check_connect_timeouts(Worker *w);
 
 /* ── backend / client event handlers ───────────────────────────────── */
 void handle_backend_writable(Worker *w, PoolConn *conn);

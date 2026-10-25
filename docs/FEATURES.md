@@ -46,7 +46,9 @@ invalidation; `EXECABORT`). `MULTI` itself is answered locally, and keyless comm
 the first key (`PING`, `ECHO`, ...) are answered `+QUEUED` locally and replayed on the pinned
 connection. A keyless-only transaction runs on the first master. Pub/Sub, `AUTH`, `HELLO`,
 `SELECT`, `CLIENT`, `ACL` and `MODULE` are rejected inside `MULTI` (and make `EXEC` return
-`EXECABORT`). Pinned connections are reused after `EXEC`/`DISCARD`/`UNWATCH`.
+`EXECABORT`). Pinned connections are reused after `EXEC`/`DISCARD`/`UNWATCH`. While a `WATCH` is
+active, `SELECT`, `AUTH` and `HELLO` are rejected (the pinned connection keeps the db, user and
+protocol it was opened with); `UNWATCH` first.
 
 ## 3. No-key broadcast / single-node forward command details
 

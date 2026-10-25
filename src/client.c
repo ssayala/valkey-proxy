@@ -1,18 +1,29 @@
 #include "proxy.h"
 
 /* ── client helpers ─────────────────────────────────────────────────── */
+/* Legacy handlers' error replies go through the client's output buffer like
+ * every other reply: writing them straight to the socket would lose them
+ * when the socket buffer is full (and the next reply would then answer the
+ * wrong command). */
 void client_send_error(Worker *w, ClientConn *client, const char *msg) {
     char buf[256];
     int n = snprintf(buf, sizeof(buf), "-ERR %s\r\n", msg);
-    ssize_t wr = net_write(client->fd, client->ssl, buf, (size_t)n, NULL);
-    (void)wr;
-    (void)w;
+    client_queue_reply(w, client, buf, n);
 }
 
-void client_send_crossslot(ClientConn *client) {
-    const char *err = "-CROSSSLOT Keys in request don't hash to the same slot\r\n";
-    ssize_t wr = net_write(client->fd, client->ssl, err, strlen(err), NULL);
-    (void)wr;
+void client_send_crossslot(Worker *w, ClientConn *client) {
+    static const char err[] = "-CROSSSLOT Keys in request don't hash to the same slot\r\n";
+    client_queue_reply(w, client, err, (int)sizeof(err) - 1);
+}
+
+/* Valkey's reply to a command with too few arguments. */
+void client_send_wrong_arity(Worker *w, ClientConn *client, const char *cmd) {
+    char lc[64], msg[128];
+    int n = 0;
+    for (; cmd[n] && n < 63; n++) lc[n] = (char)tolower((unsigned char)cmd[n]);
+    lc[n] = '\0';
+    snprintf(msg, sizeof(msg), "wrong number of arguments for '%s' command", lc);
+    client_send_error(w, client, msg);
 }
 
 void close_client(Worker *w, ClientConn *client) {
@@ -74,6 +85,13 @@ void close_client(Worker *w, ClientConn *client) {
         pool_destroy_conn(w, sc);
     }
     acl_teardown_all(w, client);
+    /* Best effort: an error sent just before closing (e.g. protocol error,
+     * out of memory) still reaches the client if the socket takes it. */
+    if (client->wbuf_len > client->wbuf_off && !client->tls_hs) {
+        ssize_t wr = net_write(fd, client->ssl, client->wbuf + client->wbuf_off,
+                               (size_t)(client->wbuf_len - client->wbuf_off), NULL);
+        (void)wr;
+    }
     free(client->wbuf);
     free(client->pbuf);
     free(client->ibuf);
@@ -550,6 +568,8 @@ void legacy_dispatch(Worker *w, ClientConn *client, char *cmd, int cmdlen, char 
             const char *obj_key;
             int obj_keylen;
             if (!resp_get_nth_arg(client->hbuf, client->hbuf_len, 2, &obj_key, &obj_keylen)) {
+                client_send_wrong_arity(w, client, cmd);
+                client->hbuf_len = 0;
                 return;
             }
             keylen = obj_keylen < 511 ? obj_keylen : 511;
@@ -583,6 +603,8 @@ void legacy_dispatch(Worker *w, ClientConn *client, char *cmd, int cmdlen, char 
             const char *xg_key;
             int xg_keylen;
             if (!resp_get_nth_arg(client->hbuf, client->hbuf_len, 2, &xg_key, &xg_keylen)) {
+                client_send_wrong_arity(w, client, cmd);
+                client->hbuf_len = 0;
                 return;
             }
             keylen = xg_keylen < 511 ? xg_keylen : 511;
@@ -595,6 +617,8 @@ void legacy_dispatch(Worker *w, ClientConn *client, char *cmd, int cmdlen, char 
                 const char *mem_key;
                 int mem_keylen;
                 if (!resp_get_nth_arg(client->hbuf, client->hbuf_len, 2, &mem_key, &mem_keylen)) {
+                    client_send_wrong_arity(w, client, cmd);
+                    client->hbuf_len = 0;
                     return;
                 }
                 keylen = mem_keylen < 511 ? mem_keylen : 511;

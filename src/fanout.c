@@ -1361,8 +1361,7 @@ static void handle_fanout_cmd_impl(Worker *w, ClientConn *client, const char *cm
         }
         if (lcs_mode == 2) {
             const char *e = "-ERR LCS IDX is not supported for cross-slot keys\r\n";
-            ssize_t wr = net_write(client->fd, client->ssl, e, strlen(e), NULL);
-            (void)wr;
+            client_queue_reply(w, client, e, (int)strlen(e));
             FANOUT_RESET_CLIENT(client);
             return;
         }
@@ -3344,8 +3343,7 @@ void handle_nokey_cmd(Worker *w, ClientConn *client, const char *cmd, int cmdlen
         }
         if (db != 0) {
             const char *e = "-ERR DB index is out of range\r\n";
-            ssize_t wr = net_write(client->fd, client->ssl, e, strlen(e), NULL);
-            (void)wr;
+            client_queue_reply(w, client, e, (int)strlen(e));
             client->hbuf_len = 0;
             return;
         }
@@ -3637,7 +3635,7 @@ void handle_multikey_complete(Worker *w, ClientConn *client, const char *cmd) {
         int slot = key_slot(kp[0], kl[0]);
         for (int i = 1; i < nkeys; i++) {
             if (key_slot(kp[i], kl[i]) != slot) {
-                client_send_crossslot(client);
+                client_send_crossslot(w, client);
                 client->pbuf_len = 0;
                 client->hbuf_len = 0;
                 client->using_pbuf = 0;

@@ -358,6 +358,10 @@ static int proxy_connect(const char *host, int port) {
         close(fd);
         return -1;
     }
+    /* A reply that never comes fails the check instead of hanging the whole
+     * run (far above any blocking command's timeout in the suites). */
+    struct timeval tv = {30, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
 }
 

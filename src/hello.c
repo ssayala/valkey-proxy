@@ -343,10 +343,9 @@ void handle_resp3_handshake_readable(Worker *w, PoolConn *conn) {
     }
 }
 
-static void hello_send_noproto(ClientConn *client) {
+static void hello_send_noproto(Worker *w, ClientConn *client) {
     static const char msg[] = "-NOPROTO unsupported protocol version\r\n";
-    ssize_t wr = net_write(client->fd, client->ssl, msg, sizeof(msg) - 1, NULL);
-    (void)wr;
+    client_queue_reply(w, client, msg, (int)sizeof(msg) - 1);
 }
 
 /* Same acceptance rules as Valkey's string2ll(): optional '-', no leading
@@ -525,7 +524,7 @@ void handle_hello_cmd(Worker *w, ClientConn *client, int cmdlen) {
         return;
     }
     if (has_protover && (protover_len != 1 || (protover[0] != '2' && protover[0] != '3'))) {
-        hello_send_noproto(client);
+        hello_send_noproto(w, client);
         client->hbuf_len = 0;
         return;
     }

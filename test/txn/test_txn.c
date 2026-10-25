@@ -119,6 +119,28 @@ void run_txn_tests(const char *host, int port, int *pass, int *fail) {
         close(fd2);
     }
 
+    /* ── connection state can't change under a WATCH-pinned connection ── */
+    proxy_cmd(fd, r, sizeof(r), 2, "WATCH", "{tc:tx}w");
+    proxy_cmd(fd, r, sizeof(r), 2, "SELECT", "0");
+    CHECK(strstr(r, "WATCH is active") != NULL, "SELECT while WATCH is active is rejected", pass, fail);
+    proxy_cmd(fd, r, sizeof(r), 1, "UNWATCH");
+    proxy_cmd(fd, r, sizeof(r), 2, "SELECT", "0");
+    CHECK(!strcmp(r, "+OK"), "SELECT allowed again after UNWATCH", pass, fail);
+
+    /* ── missing arguments get an error reply, not silence ────────────── */
+    send_str(fd, "*2\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n*2\r\n$5\r\nXINFO\r\n$6\r\nSTREAM\r\n"
+                 "*2\r\n$6\r\nMEMORY\r\n$5\r\nUSAGE\r\n*1\r\n$4\r\nPING\r\n");
+    {
+        int ok = 1;
+        for (int i = 0; i < 3; i++) {
+            resp_next_str(fd, r, sizeof(r));
+            if (strncmp(r, "-ERR wrong number of arguments", 30) != 0) ok = 0;
+        }
+        resp_next_str(fd, r, sizeof(r));
+        CHECK(ok && !strcmp(r, "+PONG"), "OBJECT/XINFO/MEMORY without key: arity errors, replies stay in step",
+              pass, fail);
+    }
+
     /* ── inline commands ───────────────────────────────────────────────── */
     send_str(fd, "SET {tc:tx}inl \"a b\\x41\"\r\nGET {tc:tx}inl\r\n\r\nPING\nECHO 'it\\'s'\r\n");
     {
