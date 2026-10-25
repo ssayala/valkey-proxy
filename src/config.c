@@ -11,7 +11,7 @@ void parse_conf(const char *path) {
     g_config.db = 0;
     g_config.tls_enabled = 0;
     g_config.tls_backend_verify = 1;
-    g_config.tls_ktls = 1;
+    g_config.tls_ktls = 0; /* see the tls-ktls note in README.md */
     g_config.max_multikey_payload = 64 * 1024 * 1024;
     g_config.max_connection = DEFAULT_MAX_CONNECTIONS;
     g_config.cluster_refresh_interval_ms = 0; /* 0 = periodic refresh disabled */

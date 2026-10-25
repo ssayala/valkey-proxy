@@ -16,6 +16,10 @@
  * already-decrypted data, with no change needed here. */
 
 #ifdef USE_TLS
+#ifdef __linux__
+#include <linux/tls.h>
+#endif
+
 SSL_CTX *g_backend_ssl_ctx = NULL;
 
 static void ctx_common(SSL_CTX *ctx) {
@@ -135,11 +139,30 @@ static ssize_t ssl_result(SSL *ssl, int rc, int *want) {
     }
 }
 
+/* With TLS 1.3 kTLS RX the kernel can't tell where a record's content ends
+ * until it has decrypted it (padding), so by default it decrypts into a
+ * kernel buffer and copies out. Peers using OpenSSL/BoringSSL/rustls don't
+ * pad, so promising "no padding" lets it decrypt straight into our buffer;
+ * a padded record is just decrypted again (slower, still correct). */
+static void ktls_tune(SSL *ssl) {
+#if defined(__linux__) && defined(TLS_RX_EXPECT_NO_PAD)
+    if (SSL_version(ssl) == TLS1_3_VERSION && BIO_get_ktls_recv(SSL_get_rbio(ssl))) {
+        int one = 1;
+        setsockopt(SSL_get_fd(ssl), SOL_TLS, TLS_RX_EXPECT_NO_PAD, &one, sizeof(one));
+    }
+#else
+    (void)ssl;
+#endif
+}
+
 int tls_handshake(TlsConn *ssl, int *want) {
     ERR_clear_error();
     errno = 0;
     int rc = SSL_do_handshake(ssl);
-    if (rc == 1) return 1;
+    if (rc == 1) {
+        ktls_tune(ssl);
+        return 1;
+    }
     ssize_t r = ssl_result(ssl, rc, want);
     if (r < 0 && errno == EAGAIN) return 0;
     return -1;
@@ -177,6 +200,7 @@ TlsConn *tls_connect_blocking(int fd, int timeout_ms) {
         SSL_free(ssl);
         return NULL;
     }
+    ktls_tune(ssl);
     struct timeval zero = {0, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));

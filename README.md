@@ -62,12 +62,15 @@ tls-enabled  no
 # tls-backend-cert     /etc/ssl/certs/proxy-client.crt   # client cert, if the nodes require one
 # tls-backend-key      /etc/ssl/private/proxy-client.key
 
-# Kernel TLS offload (default: yes). After the handshake OpenSSL hands record
+# Kernel TLS (default: no). After the handshake OpenSSL hands record
 # encryption/decryption to the kernel when possible: Linux with the `tls`
-# module loaded (`modprobe tls`) and an AES-GCM / ChaCha20-Poly1305 cipher.
-# Falls back to userspace TLS otherwise. Run with `verbose yes` to see which
-# connections got kTLS.
-# tls-ktls  yes
+# module loaded (`modprobe tls`) and an AES-GCM / ChaCha20-Poly1305 cipher;
+# otherwise it silently stays in userspace. `verbose yes` logs which
+# connections got kTLS. This only moves the crypto into the kernel -- on a
+# plain NIC it measured equal to ~18% *more* proxy CPU than userspace TLS
+# (larger values cost more), so it's worth enabling only with NICs that do
+# TLS offload in hardware.
+# tls-ktls  no
 
 # Unix domain socket (optional)
 # unix-socket  /tmp/valkey-proxy.sock
