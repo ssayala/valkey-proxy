@@ -21,6 +21,9 @@
 #ifdef USE_TLS
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+typedef SSL TlsConn;
+#else
+typedef void TlsConn;
 #endif
 
 /* ── constants ──────────────────────────────────────────────────────── */
@@ -85,6 +88,7 @@ typedef enum { CONN_AVAILABLE = 0, CONN_IN_USE = 1 } ConnState;
 
 typedef struct {
     int fd;
+    TlsConn *ssl; /* NULL = plain TCP */
     ConnState state;
     int db;
     ConnPool *pool;
@@ -178,8 +182,11 @@ struct Req {
 
 struct MuxConn {
     int fd;
+    TlsConn *ssl;
     int node_idx, db, resp;
     int connecting; /* non-blocking connect() still in progress */
+    int tls_hs;     /* TLS handshake in progress (after connect) */
+    int ssl_read_wants_write;
     int draining;   /* node identity moved on: no new requests, close once idle */
     struct NodePools *owner;
     char *obuf;
@@ -303,9 +310,11 @@ struct ClientConn {
     int waiting_acl_help;           /* 1 = pending reply is an ACL HELP probe */
     /* ── RESP protocol version (see src/hello.c) ────────────────────────── */
     int resp; /* 2 or 3; set at accept() time, changed by HELLO */
-#ifdef USE_TLS
-    SSL *ssl;
-#endif
+    TlsConn *ssl; /* NULL = plain TCP */
+    int tls_hs;   /* server-side TLS handshake still in progress */
+    /* TLS can need the other direction to make progress (a read waiting on
+     * writability, or a write on readability); see net_read()/net_write(). */
+    int ssl_read_wants_write, ssl_write_wants_read;
 };
 
 /* ── fan-out sub-request and context ───────────────────────────────── */
@@ -401,6 +410,12 @@ typedef struct {
     char unix_socket_path[256];
     int tls_enabled;
     char tls_cert[256], tls_key[256];
+    char tls_ca_cert[256];
+    int tls_auth_clients; /* 0 = no, 1 = yes (required), 2 = optional */
+    int tls_backend;      /* connect to cluster nodes over TLS */
+    char tls_backend_ca_cert[256], tls_backend_cert[256], tls_backend_key[256];
+    int tls_backend_verify;
+    int tls_ktls; /* let OpenSSL offload records to kernel TLS when possible */
     int max_multikey_payload;
     int max_connection;
     int cluster_refresh_interval_ms; /* 0 = periodic refresh disabled */
@@ -451,6 +466,7 @@ extern Worker g_workers[MAX_WORKERS];
 extern int g_tcp_fd, g_unix_fd;
 #ifdef USE_TLS
 extern SSL_CTX *g_ssl_ctx;
+extern SSL_CTX *g_backend_ssl_ctx;
 #endif
 
 /* Per-command / per-connection trace logging. Off by default: these fire on
@@ -485,7 +501,22 @@ int create_tcp_listener(const char *ip, int port);
 int create_unix_listener(const char *path);
 #ifdef USE_TLS
 int init_tls(void);
+int init_backend_tls(void);
+TlsConn *tls_new(int fd, int server);
+void tls_free(TlsConn *ssl);
+int tls_handshake(TlsConn *ssl, int *want); /* 1 done, 0 in progress, -1 failed */
+int tls_ktls_state(TlsConn *ssl);           /* bit 0 = tx offloaded, bit 1 = rx */
+const char *tls_describe(TlsConn *ssl, char *buf, int cap);
+TlsConn *tls_connect_blocking(int fd, int timeout_ms);
 #endif
+/* read()/write() on fd, through TLS when ssl != NULL (see src/tls.c). */
+ssize_t net_read(int fd, TlsConn *ssl, void *buf, size_t n, int *want);
+ssize_t net_write(int fd, TlsConn *ssl, const void *buf, size_t n, int *want);
+int net_write_all(int fd, TlsConn *ssl, const void *buf, size_t n);
+int net_short_read_drained(TlsConn *ssl);
+/* Connects to a backend node, blocking, including the TLS handshake when
+ * tls-backend is on; *ssl_out gets the session (NULL for plain TCP). */
+int backend_connect_blocking(const char *ip, int port, int timeout_ms, TlsConn **ssl_out);
 
 /* ── cluster ────────────────────────────────────────────────────────── */
 void fetch_cluster_nodes(void);
@@ -606,6 +637,7 @@ void client_process_input(Worker *w, ClientConn *client);
  * ndone == nsubs after dispatching every sub, as before. */
 void fanout_send_sub(Worker *w, FanoutSub *sub, const char *cmd, int len);
 int client_flush(Worker *w, ClientConn *client);
+void client_tls_continue(Worker *w, ClientConn *client);
 void client_detach_requests(Worker *w, ClientConn *client);
 void client_release_tx(Worker *w, ClientConn *client);
 void client_list_unlink(Worker *w, ClientConn *client);

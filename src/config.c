@@ -10,6 +10,8 @@ void parse_conf(const char *path) {
     g_config.worker_thread_no = 1;
     g_config.db = 0;
     g_config.tls_enabled = 0;
+    g_config.tls_backend_verify = 1;
+    g_config.tls_ktls = 1;
     g_config.max_multikey_payload = 64 * 1024 * 1024;
     g_config.max_connection = DEFAULT_MAX_CONNECTIONS;
     g_config.cluster_refresh_interval_ms = 0; /* 0 = periodic refresh disabled */
@@ -40,6 +42,22 @@ void parse_conf(const char *path) {
             snprintf(g_config.tls_cert, 256, "%.255s", val);
         else if (!strcmp(key, "tls-key"))
             snprintf(g_config.tls_key, 256, "%.255s", val);
+        else if (!strcmp(key, "tls-ca-cert"))
+            snprintf(g_config.tls_ca_cert, 256, "%.255s", val);
+        else if (!strcmp(key, "tls-auth-clients"))
+            g_config.tls_auth_clients = !strcmp(val, "yes") ? 1 : !strcmp(val, "optional") ? 2 : 0;
+        else if (!strcmp(key, "tls-backend"))
+            g_config.tls_backend = (!strcmp(val, "yes"));
+        else if (!strcmp(key, "tls-backend-ca-cert"))
+            snprintf(g_config.tls_backend_ca_cert, 256, "%.255s", val);
+        else if (!strcmp(key, "tls-backend-cert"))
+            snprintf(g_config.tls_backend_cert, 256, "%.255s", val);
+        else if (!strcmp(key, "tls-backend-key"))
+            snprintf(g_config.tls_backend_key, 256, "%.255s", val);
+        else if (!strcmp(key, "tls-backend-verify"))
+            g_config.tls_backend_verify = (!strcmp(val, "yes"));
+        else if (!strcmp(key, "tls-ktls"))
+            g_config.tls_ktls = (!strcmp(val, "yes"));
         else if (!strcmp(key, "max_multikey_payload"))
             g_config.max_multikey_payload = atoi(val);
         else if (!strcmp(key, "max_connection"))
@@ -213,34 +231,20 @@ int create_unix_listener(const char *path) {
     return fd;
 }
 
-/* ── TLS ────────────────────────────────────────────────────────────── */
+/* Blocking connect (+ TLS handshake when tls-backend is on) to a backend
+ * node; returns a blocking fd, or -1. */
+int backend_connect_blocking(const char *ip, int port, int timeout_ms, TlsConn **ssl_out) {
+    *ssl_out = NULL;
+    int fd = tcp_connect_timeout(ip, port, timeout_ms);
+    if (fd < 0) return -1;
 #ifdef USE_TLS
-int init_tls(void) {
-    if (!g_config.tls_cert[0] || !g_config.tls_key[0]) {
-        fprintf(stderr, "TLS: cert/key not set\n");
-        return -1;
+    if (g_config.tls_backend) {
+        *ssl_out = tls_connect_blocking(fd, timeout_ms);
+        if (!*ssl_out) {
+            close(fd);
+            return -1;
+        }
     }
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
-    SSL_load_error_strings();
-    g_ssl_ctx = SSL_CTX_new(TLS_server_method());
-    if (!g_ssl_ctx) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-    if (SSL_CTX_use_certificate_file(g_ssl_ctx, g_config.tls_cert, SSL_FILETYPE_PEM) <= 0) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-    if (SSL_CTX_use_PrivateKey_file(g_ssl_ctx, g_config.tls_key, SSL_FILETYPE_PEM) <= 0) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-    if (!SSL_CTX_check_private_key(g_ssl_ctx)) {
-        fprintf(stderr, "TLS: cert/key mismatch\n");
-        return -1;
-    }
-    printf("TLS enabled  cert=%s\n", g_config.tls_cert);
-    return 0;
-}
 #endif
+    return fd;
+}

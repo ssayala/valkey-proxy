@@ -71,7 +71,8 @@ void handle_fanout_sub_readable(Worker *w, PoolConn *conn) {
             sub->rbuf = tmp;
             sub->rbuf_cap = nc;
         }
-        ssize_t n = read(conn->fd, sub->rbuf + sub->rbuf_len, (size_t)(sub->rbuf_cap - sub->rbuf_len));
+        ssize_t n =
+            net_read(conn->fd, conn->ssl, sub->rbuf + sub->rbuf_len, (size_t)(sub->rbuf_cap - sub->rbuf_len), NULL);
         if (n < 0) {
             if (errno == EAGAIN) return; /* drained; wait for more data */
             sub->error = 1;
@@ -1360,7 +1361,7 @@ static void handle_fanout_cmd_impl(Worker *w, ClientConn *client, const char *cm
         }
         if (lcs_mode == 2) {
             const char *e = "-ERR LCS IDX is not supported for cross-slot keys\r\n";
-            ssize_t wr = write(client->fd, e, strlen(e));
+            ssize_t wr = net_write(client->fd, client->ssl, e, strlen(e), NULL);
             (void)wr;
             FANOUT_RESET_CLIENT(client);
             return;
@@ -3343,7 +3344,7 @@ void handle_nokey_cmd(Worker *w, ClientConn *client, const char *cmd, int cmdlen
         }
         if (db != 0) {
             const char *e = "-ERR DB index is out of range\r\n";
-            ssize_t wr = write(client->fd, e, strlen(e));
+            ssize_t wr = net_write(client->fd, client->ssl, e, strlen(e), NULL);
             (void)wr;
             client->hbuf_len = 0;
             return;

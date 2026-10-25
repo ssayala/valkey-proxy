@@ -314,6 +314,9 @@ static void mux_destroy(Worker *w, MuxConn *m) {
     if (m->fd >= 0) {
         fd_unwatch(w, m->fd, EL_READABLE | EL_WRITABLE);
         if (m->fd < g_config.max_connection) w->mux_map[m->fd] = NULL;
+#ifdef USE_TLS
+        tls_free(m->ssl);
+#endif
         close(m->fd);
     }
     free(m->obuf);
@@ -413,8 +416,21 @@ static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
     m->connecting = rc < 0;
     m->owner = np;
     m->gen = np->gen;
+#ifdef USE_TLS
+    if (g_config.tls_backend) {
+        m->ssl = tls_new(fd, 0);
+        if (!m->ssl) {
+            close(fd);
+            free(m);
+            return NULL;
+        }
+        m->tls_hs = 1;
+    }
+#endif
     w->mux_map[fd] = m;
-    fd_watch(w, fd, EL_READABLE | (m->connecting ? EL_WRITABLE : 0));
+    /* Writable fires once connect() completes; the TLS handshake (if any)
+     * starts from there, and queued commands are flushed after it. */
+    fd_watch(w, fd, EL_READABLE | (m->connecting || m->tls_hs ? EL_WRITABLE : 0));
 
     /* Connection setup rides the same pipeline as the first real commands;
      * these replies are swallowed (see req_deliver()). */
@@ -453,13 +469,16 @@ static MuxConn *mux_for(Worker *w, ClientConn *c, int node_idx) {
 }
 
 static void mux_flush(Worker *w, MuxConn *m) {
-    if (m->connecting) return; /* handle_mux_writable() flushes once connected */
+    if (m->connecting || m->tls_hs) return; /* handle_mux_writable() flushes once connected */
     while (m->obuf_off < m->obuf_len) {
-        ssize_t n = write(m->fd, m->obuf + m->obuf_off, (size_t)(m->obuf_len - m->obuf_off));
+        int want;
+        ssize_t n = net_write(m->fd, m->ssl, m->obuf + m->obuf_off, (size_t)(m->obuf_len - m->obuf_off), &want);
         if (n < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN) {
-                if (!(w->fd_mask[m->fd] & EL_WRITABLE)) fd_watch(w, m->fd, EL_WRITABLE);
+                /* want == EL_READABLE: TLS needs input first; handle_mux_readable()
+                 * re-queues the flush. */
+                if (want != EL_READABLE && !(w->fd_mask[m->fd] & EL_WRITABLE)) fd_watch(w, m->fd, EL_WRITABLE);
                 return;
             }
             mux_fail(w, m, "backend connection error");
@@ -468,7 +487,37 @@ static void mux_flush(Worker *w, MuxConn *m) {
         m->obuf_off += (int)n;
     }
     m->obuf_off = m->obuf_len = 0;
-    if (w->fd_mask[m->fd] & EL_WRITABLE) fd_unwatch(w, m->fd, EL_WRITABLE);
+    if ((w->fd_mask[m->fd] & EL_WRITABLE) && !m->ssl_read_wants_write) fd_unwatch(w, m->fd, EL_WRITABLE);
+}
+
+/* Advances the backend TLS handshake. Returns -1 if it failed (m is gone). */
+static int mux_tls_step(Worker *w, MuxConn *m) {
+#ifdef USE_TLS
+    int want;
+    int rc = tls_handshake(m->ssl, &want);
+    if (rc < 0) {
+        mux_fail(w, m, "backend TLS handshake failed");
+        return -1;
+    }
+    if (rc == 0) {
+        if (want == EL_WRITABLE) {
+            if (!(w->fd_mask[m->fd] & EL_WRITABLE)) fd_watch(w, m->fd, EL_WRITABLE);
+        } else if (w->fd_mask[m->fd] & EL_WRITABLE) {
+            fd_unwatch(w, m->fd, EL_WRITABLE);
+        }
+        return 0;
+    }
+    m->tls_hs = 0;
+    if (g_config.verbose) {
+        char d[128];
+        printf("[worker %d] [mux] fd=%d TLS %s\n", w->thread_id, m->fd, tls_describe(m->ssl, d, sizeof(d)));
+    }
+    pf_add(w, m); /* commands queued during the handshake */
+#else
+    (void)w;
+    (void)m;
+#endif
+    return 0;
 }
 
 void handle_mux_writable(Worker *w, MuxConn *m) {
@@ -481,6 +530,15 @@ void handle_mux_writable(Worker *w, MuxConn *m) {
             return;
         }
         m->connecting = 0;
+    }
+    if (m->tls_hs) {
+        if (mux_tls_step(w, m) < 0 || m->tls_hs) return;
+    }
+    if (m->ssl_read_wants_write) {
+        int fd = m->fd;
+        m->ssl_read_wants_write = 0;
+        handle_mux_readable(w, m);
+        if (w->mux_map[fd] != m) return;
     }
     mux_flush(w, m);
 }
@@ -550,17 +608,27 @@ static int mux_try_redirect(Worker *w, MuxConn *m, Req *r, const char *d, int le
 }
 
 void handle_mux_readable(Worker *w, MuxConn *m) {
+    if (m->connecting) return; /* refused/reset connects are reported via handle_mux_writable() */
+    if (m->tls_hs) {
+        if (mux_tls_step(w, m) < 0 || m->tls_hs) return;
+    }
     for (;;) {
         if (m->rbuf_off == m->rbuf_len) m->rbuf_off = m->rbuf_len = 0;
         if (buf_reserve(&m->rbuf, &m->rbuf_len, &m->rbuf_off, &m->rbuf_cap, IO_CHUNK) < 0) {
             mux_fail(w, m, "out of memory");
             return;
         }
-        int space = m->rbuf_cap - m->rbuf_len;
-        ssize_t n = read(m->fd, m->rbuf + m->rbuf_len, (size_t)space);
+        int space = m->rbuf_cap - m->rbuf_len, want;
+        ssize_t n = net_read(m->fd, m->ssl, m->rbuf + m->rbuf_len, (size_t)space, &want);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN) break;
+            if (errno == EAGAIN) {
+                if (want == EL_WRITABLE) {
+                    m->ssl_read_wants_write = 1;
+                    if (!(w->fd_mask[m->fd] & EL_WRITABLE)) fd_watch(w, m->fd, EL_WRITABLE);
+                }
+                break;
+            }
             mux_fail(w, m, "backend connection error");
             return;
         }
@@ -593,8 +661,11 @@ void handle_mux_readable(Worker *w, MuxConn *m) {
             if (reply[0] == '-' && !r->internal && !m->pin_client && mux_try_redirect(w, m, r, reply, rl)) continue;
             req_deliver(w, r, reply, rl);
         }
-        if (n < space) break; /* socket drained (edge-triggered: no more data until next edge) */
+        /* Plain TCP: a short read means the socket is drained (edge-
+         * triggered, so nothing more until the next edge). */
+        if (n < space && net_short_read_drained(m->ssl)) break;
     }
+    if (m->obuf_off < m->obuf_len) pf_add(w, m); /* a TLS write may have been waiting on this read */
     if (m->draining && m->inflight == 0) mux_drained(w, m);
 }
 
@@ -1248,8 +1319,48 @@ void client_process_input(Worker *w, ClientConn *c) {
         bl_remove(w, c);
 }
 
+/* Advances a client's server-side TLS handshake; once done, carries on with
+ * whatever the client already sent behind it. */
+void client_tls_continue(Worker *w, ClientConn *c) {
+#ifdef USE_TLS
+    int want;
+    int rc = tls_handshake(c->ssl, &want);
+    if (rc < 0) {
+        LOG_VERBOSE("[worker %d] TLS handshake failed for %s\n", w->thread_id, c->addr);
+        close_client(w, c);
+        return;
+    }
+    if (rc == 0) {
+        if (want == EL_WRITABLE) {
+            if (!(w->fd_mask[c->fd] & EL_WRITABLE)) fd_watch(w, c->fd, EL_WRITABLE);
+        } else if (w->fd_mask[c->fd] & EL_WRITABLE) {
+            fd_unwatch(w, c->fd, EL_WRITABLE);
+        }
+        return;
+    }
+    c->tls_hs = 0;
+    if (w->fd_mask[c->fd] & EL_WRITABLE) fd_unwatch(w, c->fd, EL_WRITABLE);
+    if (g_config.verbose) {
+        char d[128];
+        printf("[worker %d] client %s TLS %s\n", w->thread_id, c->addr, tls_describe(c->ssl, d, sizeof(d)));
+    }
+    handle_client_readable(w, c);
+#else
+    (void)w;
+    (void)c;
+#endif
+}
+
 void handle_client_readable(Worker *w, ClientConn *c) {
     int fd = c->fd;
+    if (c->tls_hs) {
+        client_tls_continue(w, c);
+        return;
+    }
+    if (c->ssl_write_wants_read) {
+        c->ssl_write_wants_read = 0;
+        pw_add(w, c);
+    }
     for (;;) {
         int unparsed = c->ibuf_len - c->ibuf_off;
         if (unparsed >= CLIENT_READ_PAUSE && unparsed >= c->ibuf_need) {
@@ -1273,11 +1384,17 @@ void handle_client_readable(Worker *w, ClientConn *c) {
             close_client(w, c);
             return;
         }
-        int space = c->ibuf_cap - c->ibuf_len;
-        ssize_t n = read(fd, c->ibuf + c->ibuf_len, (size_t)space);
+        int space = c->ibuf_cap - c->ibuf_len, tls_want;
+        ssize_t n = net_read(fd, c->ssl, c->ibuf + c->ibuf_len, (size_t)space, &tls_want);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN) break;
+            if (errno == EAGAIN) {
+                if (tls_want == EL_WRITABLE) {
+                    c->ssl_read_wants_write = 1;
+                    if (!(w->fd_mask[fd] & EL_WRITABLE)) fd_watch(w, fd, EL_WRITABLE);
+                }
+                break;
+            }
             close_client(w, c);
             return;
         }
@@ -1286,7 +1403,7 @@ void handle_client_readable(Worker *w, ClientConn *c) {
             return;
         }
         c->ibuf_len += (int)n;
-        if (n < space) break;
+        if (n < space && net_short_read_drained(c->ssl)) break;
     }
     c->read_paused = 0;
     client_process_input(w, c);
@@ -1299,12 +1416,17 @@ int client_flush(Worker *w, ClientConn *c) {
         close_client(w, c);
         return -1;
     }
+    if (c->tls_hs) return 0; /* replies wait for the handshake (can't happen in practice) */
     while (c->wbuf_off < c->wbuf_len) {
-        ssize_t n = write(c->fd, c->wbuf + c->wbuf_off, (size_t)(c->wbuf_len - c->wbuf_off));
+        int want;
+        ssize_t n = net_write(c->fd, c->ssl, c->wbuf + c->wbuf_off, (size_t)(c->wbuf_len - c->wbuf_off), &want);
         if (n < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN) {
-                if (!(w->fd_mask[c->fd] & EL_WRITABLE)) fd_watch(w, c->fd, EL_WRITABLE);
+                if (want == EL_READABLE)
+                    c->ssl_write_wants_read = 1; /* handle_client_readable() retries */
+                else if (!(w->fd_mask[c->fd] & EL_WRITABLE))
+                    fd_watch(w, c->fd, EL_WRITABLE);
                 return 0;
             }
             close_client(w, c);
@@ -1317,7 +1439,7 @@ int client_flush(Worker *w, ClientConn *c) {
         close_client(w, c);
         return -1;
     }
-    if (w->fd_mask[c->fd] & EL_WRITABLE) fd_unwatch(w, c->fd, EL_WRITABLE);
+    if ((w->fd_mask[c->fd] & EL_WRITABLE) && !c->ssl_read_wants_write) fd_unwatch(w, c->fd, EL_WRITABLE);
     if (c->state == CS_WRITING_RESP) {
         /* A legacy reply just finished going out. */
         c->state = CS_READING_HDR;

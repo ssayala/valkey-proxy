@@ -48,10 +48,26 @@ min_subscription_connection  0
 min_transaction_connection   0
 min_acl_connection           0
 
-# TLS (client ↔ proxy)
+# TLS (client ↔ proxy), TCP listener only -- the unix socket stays plaintext
 tls-enabled  no
-# tls-cert  /etc/ssl/certs/proxy.crt
+# tls-cert  /etc/ssl/certs/proxy.crt      # certificate (chain) presented to clients
 # tls-key   /etc/ssl/private/proxy.key
+# tls-ca-cert       /etc/ssl/certs/ca.crt # CA for verifying client certificates
+# tls-auth-clients  no                    # no | yes (require a client cert) | optional
+
+# TLS (proxy ↔ cluster nodes)
+# tls-backend          yes
+# tls-backend-ca-cert  /etc/ssl/certs/ca.crt   # default: system trust store
+# tls-backend-verify   yes                     # verify the nodes' certificate chain
+# tls-backend-cert     /etc/ssl/certs/proxy-client.crt   # client cert, if the nodes require one
+# tls-backend-key      /etc/ssl/private/proxy-client.key
+
+# Kernel TLS offload (default: yes). After the handshake OpenSSL hands record
+# encryption/decryption to the kernel when possible: Linux with the `tls`
+# module loaded (`modprobe tls`) and an AES-GCM / ChaCha20-Poly1305 cipher.
+# Falls back to userspace TLS otherwise. Run with `verbose yes` to see which
+# connections got kTLS.
+# tls-ktls  yes
 
 # Unix domain socket (optional)
 # unix-socket  /tmp/valkey-proxy.sock

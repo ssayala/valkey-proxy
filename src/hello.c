@@ -220,7 +220,8 @@ void handle_resp3_handshake_readable(Worker *w, PoolConn *conn) {
             conn->rbuf = tmp;
             conn->rbuf_cap = nc;
         }
-        ssize_t n = read(conn->fd, conn->rbuf + conn->rbuf_len, (size_t)(conn->rbuf_cap - conn->rbuf_len));
+        ssize_t n =
+            net_read(conn->fd, conn->ssl, conn->rbuf + conn->rbuf_len, (size_t)(conn->rbuf_cap - conn->rbuf_len), NULL);
         if (n < 0) {
             if (errno == EAGAIN) return;
             rlen = -1;
@@ -344,7 +345,7 @@ void handle_resp3_handshake_readable(Worker *w, PoolConn *conn) {
 
 static void hello_send_noproto(ClientConn *client) {
     static const char msg[] = "-NOPROTO unsupported protocol version\r\n";
-    ssize_t wr = write(client->fd, msg, sizeof(msg) - 1);
+    ssize_t wr = net_write(client->fd, client->ssl, msg, sizeof(msg) - 1, NULL);
     (void)wr;
 }
 

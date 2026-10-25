@@ -2,7 +2,7 @@ POOL_CC      = gcc
 POOL_CFLAGS  = -O2 -Wall -Wextra -Isrc -pthread
 POOL_LDFLAGS = -pthread
 
-# TLS support for client connections (disable with: make valkey-proxy NO_TLS=1)
+# TLS support for client and backend connections (disable with: make valkey-proxy NO_TLS=1)
 ifeq ($(NO_TLS),)
 OPENSSL_PREFIX ?= $(shell brew --prefix openssl 2>/dev/null || echo /usr)
 POOL_CFLAGS  += -DUSE_TLS -I$(OPENSSL_PREFIX)/include
@@ -12,7 +12,7 @@ endif
 POOL_TARGET = valkey-proxy
 POOL_SRCS   = src/valkey-proxy.c src/config.c src/cluster.c src/resp.c \
               src/pool.c src/cmd.c src/fanout.c src/pubsub.c src/acl.c src/client.c \
-              src/hello.c src/event_loop.c src/mux.c
+              src/hello.c src/event_loop.c src/mux.c src/tls.c
 BUILD_DIR   = build
 POOL_OBJS   = $(POOL_SRCS:%.c=$(BUILD_DIR)/%.o)
 

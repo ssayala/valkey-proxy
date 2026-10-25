@@ -121,20 +121,17 @@ static void do_accept(Worker *w, int listen_fd) {
             snprintf(client->laddr, sizeof(client->laddr), "%s:0", g_config.unix_socket_path);
 
 #ifdef USE_TLS
-        if (g_config.tls_enabled && g_ssl_ctx) {
-            client->ssl = SSL_new(g_ssl_ctx);
-            SSL_set_fd(client->ssl, fd);
-            int rc;
-            do {
-                rc = SSL_accept(client->ssl);
-            } while (rc <= 0 && SSL_get_error(client->ssl, rc) == SSL_ERROR_WANT_READ);
-            if (rc <= 0) {
-                ERR_print_errors_fp(stderr);
-                SSL_free(client->ssl);
+        /* TCP clients only (a local unix socket stays plaintext). The
+         * handshake runs non-blocking from the event loop, driven by
+         * handle_client_readable()/writable() via client_tls_continue(). */
+        if (g_config.tls_enabled && g_ssl_ctx && listen_fd == g_tcp_fd) {
+            client->ssl = tls_new(fd, 1);
+            if (!client->ssl) {
                 close(fd);
                 free(client);
                 continue;
             }
+            client->tls_hs = 1;
         }
 #endif
 
@@ -286,6 +283,12 @@ int main(int argc, char **argv) {
 
 #ifdef USE_TLS
     if (g_config.tls_enabled && init_tls() < 0) exit(1);
+    if (g_config.tls_backend && init_backend_tls() < 0) exit(1);
+#else
+    if (g_config.tls_enabled || g_config.tls_backend) {
+        fprintf(stderr, "TLS configured but this build has no TLS support (built with NO_TLS=1)\n");
+        exit(1);
+    }
 #endif
 
     /* Must be set before the refresh thread can possibly start signalling

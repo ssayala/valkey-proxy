@@ -2,7 +2,7 @@
 #include <time.h>
 
 /* ── recv_bulk (cluster discovery only) ─────────────────────────────── */
-static char *recv_bulk(int fd, size_t *out_len) {
+static char *recv_bulk(int fd, TlsConn *ssl, size_t *out_len) {
     size_t cap = 65536, len = 0;
     char *buf = malloc(cap);
     if (!buf) {
@@ -18,7 +18,7 @@ static char *recv_bulk(int fd, size_t *out_len) {
                 exit(1);
             }
         }
-        ssize_t n = read(fd, buf + len, cap - len - 1);
+        ssize_t n = net_read(fd, ssl, buf + len, cap - len - 1, NULL);
         if (n <= 0) break;
         len += n;
         buf[len] = '\0';
@@ -34,6 +34,15 @@ static char *recv_bulk(int fd, size_t *out_len) {
     }
     *out_len = len;
     return buf;
+}
+
+static void discovery_close(int fd, TlsConn *ssl) {
+#ifdef USE_TLS
+    tls_free(ssl);
+#else
+    (void)ssl;
+#endif
+    close(fd);
 }
 
 /* Exact match against one comma-separated token in a CLUSTER NODES flags
@@ -157,16 +166,16 @@ static int fetch_cluster_nodes_from(const char *ip, int port, ClusterNode *out_n
      * first even after it's confirmed dead (see topology_refresh_loop()) --
      * at 5s that alone would stretch every single cycle out to 5+ seconds,
      * badly slowing down how fast a real failover gets noticed. */
-    int fd = tcp_connect_timeout(ip, port, g_config.backend_connect_timeout_ms);
+    TlsConn *ssl;
+    int fd = backend_connect_blocking(ip, port, g_config.backend_connect_timeout_ms, &ssl);
     if (fd < 0) return -1;
-    ssize_t wn = write(fd, CLUSTER_NODES_CMD, strlen(CLUSTER_NODES_CMD));
-    if (wn < 0) {
-        close(fd);
+    if (net_write_all(fd, ssl, CLUSTER_NODES_CMD, strlen(CLUSTER_NODES_CMD)) < 0) {
+        discovery_close(fd, ssl);
         return -1;
     }
     size_t len;
-    char *resp = recv_bulk(fd, &len);
-    close(fd);
+    char *resp = recv_bulk(fd, ssl, &len);
+    discovery_close(fd, ssl);
     if (len == 0 || resp[0] == '-') {
         free(resp);
         return -1;
@@ -190,17 +199,17 @@ static int fetch_cluster_nodes_from(const char *ip, int port, ClusterNode *out_n
 
 void fetch_cluster_nodes(void) {
     printf("Connecting to %s:%d to fetch cluster topology...\n", g_config.server_ip, g_config.server_port);
-    int fd = tcp_connect(g_config.server_ip, g_config.server_port);
+    TlsConn *ssl;
+    int fd = backend_connect_blocking(g_config.server_ip, g_config.server_port, 5000, &ssl);
     if (fd < 0) exit(1);
-    ssize_t wn = write(fd, CLUSTER_NODES_CMD, strlen(CLUSTER_NODES_CMD));
-    if (wn < 0) {
+    if (net_write_all(fd, ssl, CLUSTER_NODES_CMD, strlen(CLUSTER_NODES_CMD)) < 0) {
         perror("write");
-        close(fd);
+        discovery_close(fd, ssl);
         exit(1);
     }
     size_t len;
-    char *resp = recv_bulk(fd, &len);
-    close(fd);
+    char *resp = recv_bulk(fd, ssl, &len);
+    discovery_close(fd, ssl);
     if (len == 0 || resp[0] == '-') {
         fprintf(stderr, "CLUSTER NODES failed: %.*s\n", (int)len, resp);
         free(resp);

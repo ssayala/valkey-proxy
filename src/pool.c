@@ -1,28 +1,40 @@
 #include "proxy.h"
 
 /* ── connection pool ────────────────────────────────────────────────── */
-static int send_select(int fd, int db) {
+static int send_select(int fd, TlsConn *ssl, int db) {
     char cmd[64];
     int n = snprintf(cmd, sizeof(cmd), "*2\r\n$6\r\nSELECT\r\n$%d\r\n%d\r\n", db < 10 ? 1 : db < 100 ? 2 : 3, db);
-    if (write(fd, cmd, (size_t)n) != n) return -1;
+    if (net_write_all(fd, ssl, cmd, (size_t)n) < 0) return -1;
     char resp[32];
-    ssize_t r = read(fd, resp, sizeof(resp) - 1);
+    ssize_t r = net_read(fd, ssl, resp, sizeof(resp) - 1, NULL);
     if (r <= 0) return -1;
     resp[r] = '\0';
     return (resp[0] == '+') ? 0 : -1;
 }
 
-static int pool_new_fd(Worker *w, ConnPool *p) {
+static void close_conn_fd(int fd, TlsConn *ssl) {
+#ifdef USE_TLS
+    tls_free(ssl);
+#else
+    (void)ssl;
+#endif
+    close(fd);
+}
+
+/* Opens a backend connection for pool p; *ssl_out gets its TLS session
+ * (NULL for plain TCP). */
+static int pool_new_fd(Worker *w, ConnPool *p, TlsConn **ssl_out) {
     const ClusterNode *node = &w->topo.nodes[p->node_idx];
     /* Short, configurable timeout (not tcp_connect()'s fixed 5s) -- this
      * runs on the worker thread, so a node that's momentarily unreachable
      * (a replica still finishing promotion, a node about to be grace-
      * released) would otherwise stall every client this worker is serving,
      * not just the one triggering the (re)connect. */
-    int fd = tcp_connect_timeout(node->ip, node->port, g_config.backend_connect_timeout_ms);
+    int fd = backend_connect_blocking(node->ip, node->port, g_config.backend_connect_timeout_ms, ssl_out);
     if (fd < 0) return -1;
-    if (p->db != 0 && send_select(fd, p->db) < 0) {
-        close(fd);
+    if (p->db != 0 && send_select(fd, *ssl_out, p->db) < 0) {
+        close_conn_fd(fd, *ssl_out);
+        *ssl_out = NULL;
         return -1;
     }
     set_nonblocking(fd);
@@ -48,13 +60,15 @@ static void pool_fill_to(Worker *w, ConnPool *p, int want) {
     }
     const ClusterNode *node = &w->topo.nodes[p->node_idx];
     while (p->count < want && p->count < p->max) {
-        int fd = pool_new_fd(w, p);
+        TlsConn *ssl;
+        int fd = pool_new_fd(w, p, &ssl);
         if (fd < 0) {
             fprintf(stderr, "        [%d] %s:%d FAILED\n", p->count, node->ip, node->port);
             break;
         }
         PoolConn *c = &p->conns[p->count];
         c->fd = fd;
+        c->ssl = ssl;
         c->state = CONN_AVAILABLE;
         c->db = p->db;
         c->pool = p;
@@ -134,11 +148,13 @@ PoolConn *pool_acquire_nb(Worker *w, ConnPool *p) {
             p->conns = calloc((size_t)p->max, sizeof(PoolConn));
             if (!p->conns) return NULL;
         }
-        int fd = pool_new_fd(w, p);
+        TlsConn *ssl;
+        int fd = pool_new_fd(w, p, &ssl);
         if (fd >= 0) {
             const ClusterNode *node = &w->topo.nodes[p->node_idx];
             PoolConn *c = &p->conns[p->count];
             c->fd = fd;
+            c->ssl = ssl;
             c->state = CONN_IN_USE;
             c->db = p->db;
             c->pool = p;
@@ -215,7 +231,8 @@ static int pool_reconnect_conn_or_destroy(Worker *w, PoolConn *c) {
     ConnPool *p = c->pool;
     int old_fd = c->fd;
 
-    int newfd = pool_new_fd(w, p);
+    TlsConn *newssl;
+    int newfd = pool_new_fd(w, p, &newssl);
     if (newfd < 0) {
         pool_destroy_conn(w, c);
         return -1;
@@ -224,7 +241,7 @@ static int pool_reconnect_conn_or_destroy(Worker *w, PoolConn *c) {
     fd_unwatch(w, old_fd, EL_READABLE | EL_WRITABLE);
     if (old_fd >= 0) {
         if (old_fd < g_config.max_connection) w->backend_map[old_fd] = NULL;
-        close(old_fd);
+        close_conn_fd(old_fd, c->ssl);
     }
     free(c->wbuf);
     c->wbuf = NULL;
@@ -237,6 +254,7 @@ static int pool_reconnect_conn_or_destroy(Worker *w, PoolConn *c) {
     c->resp3_deferred_len = c->resp3_deferred_cap = 0;
 
     c->fd = newfd;
+    c->ssl = newssl;
     c->db = p->db;
     c->acl_authenticating = 0;
     c->acl_is_login_probe = 0;
@@ -301,7 +319,8 @@ void pool_destroy_conn(Worker *w, PoolConn *c) {
     fd_unwatch(w, c->fd, EL_READABLE | EL_WRITABLE);
     if (c->fd >= 0) {
         if (c->fd < g_config.max_connection) w->backend_map[c->fd] = NULL;
-        close(c->fd);
+        close_conn_fd(c->fd, c->ssl);
+        c->ssl = NULL;
     }
 
     free(c->wbuf);

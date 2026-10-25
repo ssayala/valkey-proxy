@@ -4,14 +4,14 @@
 void client_send_error(Worker *w, ClientConn *client, const char *msg) {
     char buf[256];
     int n = snprintf(buf, sizeof(buf), "-ERR %s\r\n", msg);
-    ssize_t wr = write(client->fd, buf, (size_t)n);
+    ssize_t wr = net_write(client->fd, client->ssl, buf, (size_t)n, NULL);
     (void)wr;
     (void)w;
 }
 
 void client_send_crossslot(ClientConn *client) {
     const char *err = "-CROSSSLOT Keys in request don't hash to the same slot\r\n";
-    ssize_t wr = write(client->fd, err, strlen(err));
+    ssize_t wr = net_write(client->fd, client->ssl, err, strlen(err), NULL);
     (void)wr;
 }
 
@@ -77,10 +77,8 @@ void close_client(Worker *w, ClientConn *client) {
     free(client->ibuf);
     free(client->hbuf);
 #ifdef USE_TLS
-    if (client->ssl) {
-        SSL_free(client->ssl);
-        client->ssl = NULL;
-    }
+    tls_free(client->ssl);
+    client->ssl = NULL;
 #endif
     close(fd);
     free(client);
@@ -254,7 +252,8 @@ void handle_backend_writable(Worker *w, PoolConn *conn) {
         fd_unwatch(w, conn->fd, EL_WRITABLE);
         return;
     }
-    ssize_t n = write(conn->fd, conn->wbuf + conn->wbuf_off, (size_t)(conn->wbuf_len - conn->wbuf_off));
+    ssize_t n = net_write(conn->fd, conn->ssl, conn->wbuf + conn->wbuf_off, (size_t)(conn->wbuf_len - conn->wbuf_off),
+                          NULL);
     if (n < 0) {
         if (errno == EAGAIN) return;
         if (conn->fanout_sub) {
@@ -371,7 +370,8 @@ void handle_backend_readable(Worker *w, PoolConn *conn) {
             conn->rbuf_cap = nc;
         }
 
-        ssize_t n = read(conn->fd, conn->rbuf + conn->rbuf_len, (size_t)(conn->rbuf_cap - conn->rbuf_len));
+        ssize_t n =
+            net_read(conn->fd, conn->ssl, conn->rbuf + conn->rbuf_len, (size_t)(conn->rbuf_cap - conn->rbuf_len), NULL);
         if (n < 0) {
             if (errno == EAGAIN) return;
             client_recover_after_backend_error(w, cl, conn, "backend connection error");
@@ -414,6 +414,16 @@ void handle_backend_readable(Worker *w, PoolConn *conn) {
 
 /* ── client writable: flush response buffer ─────────────────────────── */
 void handle_client_writable(Worker *w, ClientConn *client) {
+    if (client->tls_hs) {
+        client_tls_continue(w, client);
+        return;
+    }
+    if (client->ssl_read_wants_write) {
+        int fd = client->fd;
+        client->ssl_read_wants_write = 0;
+        handle_client_readable(w, client);
+        if (w->client_map[fd] != client) return;
+    }
     if (!client->wbuf || client->wbuf_len == client->wbuf_off) {
         client->wbuf_len = client->wbuf_off = 0;
         fd_unwatch(w, client->fd, EL_WRITABLE);
