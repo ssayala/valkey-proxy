@@ -49,3 +49,12 @@ int el_poll(EventLoop *el, int timeout_ms) {
 const char *el_backend_name(void) {
     return el_api_name();
 }
+
+int el_pollable_fd(EventLoop *el) {
+#if defined(__linux__)
+    return ((EpollState *)el->state)->epfd;
+#else
+    (void)el;
+    return -1;
+#endif
+}

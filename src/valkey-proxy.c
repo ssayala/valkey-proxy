@@ -145,7 +145,54 @@ static void do_accept(Worker *w, int listen_fd) {
             LOG_VERBOSE("[worker %d] client connected: unix socket  fd=%d\n", w->thread_id, fd);
         }
         w->client_map[fd] = client;
+#ifdef USE_IOURING
+        if (w->ring && !client->ssl) {
+            uring_attach_client(w, client);
+            continue;
+        }
+#endif
         fd_watch(w, fd, EL_READABLE);
+    }
+}
+
+/* ── event dispatch ─────────────────────────────────────────────────── */
+void worker_dispatch_events(Worker *w, int n) {
+    for (int i = 0; i < n; i++) {
+        int fd = w->el->fired[i].fd;
+        int mask = w->el->fired[i].mask;
+        if (fd == w->listen_fd || fd == g_unix_fd) {
+            do_accept(w, fd);
+            continue;
+        }
+        if (fd == w->wake_r) {
+            /* Just a nudge -- the actual sync already ran above as soon
+             * as el_poll returned. Drain so the (edge-triggered) pipe
+             * doesn't accumulate unread bytes across many wake-ups. */
+            char drain[256];
+            while (read(fd, drain, sizeof(drain)) > 0) {}
+            pool_drain_connects(w);
+            continue;
+        }
+        if (fd < 0 || fd >= g_config.max_connection) continue;
+        if (w->client_map[fd]) {
+            ClientConn *cl = w->client_map[fd];
+            if (mask & EL_READABLE) handle_client_readable(w, cl);
+            if (cl == w->client_map[fd] && (mask & EL_WRITABLE)) handle_client_writable(w, cl);
+        } else if (w->backend_map[fd]) {
+            PoolConn *pc = w->backend_map[fd];
+            uint32_t epoch = pc->epoch;
+            if (mask & EL_WRITABLE) handle_backend_writable(w, pc);
+            /* pc==backend_map[fd] catches destruction/replacement; epoch
+             * catches an in-place hand-off to a new owner (pool_release's
+             * waiter reassignment) -- either way this fd's PoolConn is no
+             * longer the one this event was originally reported for. */
+            if (pc == w->backend_map[fd] && pc->epoch == epoch && (mask & EL_READABLE))
+                handle_backend_readable(w, pc);
+        } else if (w->mux_map[fd]) {
+            MuxConn *m = w->mux_map[fd];
+            if (mask & EL_WRITABLE) handle_mux_writable(w, m);
+            if (m == w->mux_map[fd] && (mask & EL_READABLE)) handle_mux_readable(w, m);
+        }
     }
 }
 
@@ -180,6 +227,9 @@ static void *worker_thread(void *arg) {
         if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
             fprintf(stderr, "[worker %d] could not set CPU affinity\n", w->thread_id);
     }
+#endif
+#ifdef USE_IOURING
+    if (uring_worker_init(w) == 0 && w->thread_id == 0) printf("I/O: io_uring for plain TCP client/backend sockets\n");
 #endif
     if (w->listen_fd >= 0) fd_watch(w, w->listen_fd, EL_READABLE);
     if (g_unix_fd >= 0) fd_watch(w, g_unix_fd, EL_READABLE);
@@ -221,48 +271,18 @@ static void *worker_thread(void *arg) {
 
     db_group_get(w, g_config.db);
 
+#ifdef USE_IOURING
+    if (w->ring) {
+        uring_worker_loop(w);
+        return NULL;
+    }
+#endif
     while (1) {
         int n = el_poll(w->el, worker_has_ready_backlog(w) ? 0 : -1);
         if (n < 0) break;
         w->now = time(NULL);
         if (w->topology_version_seen != topology_version_load()) worker_sync_topology(w);
-        for (int i = 0; i < n; i++) {
-            int fd = w->el->fired[i].fd;
-            int mask = w->el->fired[i].mask;
-            if (fd == w->listen_fd || fd == g_unix_fd) {
-                do_accept(w, fd);
-                continue;
-            }
-            if (fd == w->wake_r) {
-                /* Just a nudge -- the actual sync already ran above as soon
-                 * as el_poll returned. Drain so the (edge-triggered) pipe
-                 * doesn't accumulate unread bytes across many wake-ups. */
-                char drain[256];
-                while (read(fd, drain, sizeof(drain)) > 0) {}
-                pool_drain_connects(w);
-                continue;
-            }
-            if (fd < 0 || fd >= g_config.max_connection) continue;
-            if (w->client_map[fd]) {
-                ClientConn *cl = w->client_map[fd];
-                if (mask & EL_READABLE) handle_client_readable(w, cl);
-                if (cl == w->client_map[fd] && (mask & EL_WRITABLE)) handle_client_writable(w, cl);
-            } else if (w->backend_map[fd]) {
-                PoolConn *pc = w->backend_map[fd];
-                uint32_t epoch = pc->epoch;
-                if (mask & EL_WRITABLE) handle_backend_writable(w, pc);
-                /* pc==backend_map[fd] catches destruction/replacement; epoch
-                 * catches an in-place hand-off to a new owner (pool_release's
-                 * waiter reassignment) -- either way this fd's PoolConn is no
-                 * longer the one this event was originally reported for. */
-                if (pc == w->backend_map[fd] && pc->epoch == epoch && (mask & EL_READABLE))
-                    handle_backend_readable(w, pc);
-            } else if (w->mux_map[fd]) {
-                MuxConn *m = w->mux_map[fd];
-                if (mask & EL_WRITABLE) handle_mux_writable(w, m);
-                if (m == w->mux_map[fd] && (mask & EL_READABLE)) handle_mux_readable(w, m);
-            }
-        }
+        worker_dispatch_events(w, n);
         worker_after_events(w);
     }
     return NULL;

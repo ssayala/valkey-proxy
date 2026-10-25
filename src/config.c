@@ -18,6 +18,9 @@ void parse_conf(const char *path) {
     g_config.cluster_node_fail_grace_ms = 10000;
     g_config.backend_connect_timeout_ms = 1000;
     g_config.max_command_size = 512 * 1024 * 1024;
+#ifdef USE_IOURING
+    g_config.io_uring = 1; /* built in on purpose: on unless "io-uring no" */
+#endif
     char line[512], key[64], val[448];
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
@@ -66,6 +69,8 @@ void parse_conf(const char *path) {
             g_config.cluster_refresh_interval_ms = atoi(val);
         else if (!strcmp(key, "cluster_node_fail_grace_ms"))
             g_config.cluster_node_fail_grace_ms = atoi(val);
+        else if (!strcmp(key, "io-uring"))
+            g_config.io_uring = (!strcmp(val, "yes"));
         else if (!strcmp(key, "worker-cpu-affinity"))
             g_config.worker_cpu_affinity = (!strcmp(val, "yes"));
         else if (!strcmp(key, "cpu-affinity-base"))

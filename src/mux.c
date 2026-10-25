@@ -89,6 +89,15 @@ static void pf_remove(Worker *w, MuxConn *m) {
     m->pf_prev = m->pf_next = NULL;
 }
 
+/* fd_watch(fd, EL_WRITABLE) on an io_uring-managed fd: "flush me" instead
+ * of an epoll registration. */
+void worker_want_flush(Worker *w, int fd) {
+    if (w->client_map[fd])
+        pw_add(w, w->client_map[fd]);
+    else if (w->mux_map[fd])
+        pf_add(w, w->mux_map[fd]);
+}
+
 void client_list_unlink(Worker *w, ClientConn *c) {
     pw_remove(w, c);
     bl_remove(w, c);
@@ -155,6 +164,25 @@ static void client_out_append(Worker *w, ClientConn *c, const char *data, int le
     memcpy(c->wbuf + c->wbuf_len, data, (size_t)len);
     c->wbuf_len += len;
     pw_add(w, c);
+}
+
+/* Reply bytes not yet on the wire: still in wbuf, plus (io_uring) a send
+ * handed to the kernel but not completed. */
+static int client_out_bytes(const ClientConn *c) {
+    int n = c->wbuf_len - c->wbuf_off;
+#ifdef USE_IOURING
+    if (c->sop && c->sop->active) n += c->sop->len - c->sop->off;
+#endif
+    return n;
+}
+
+static int client_recv_inflight(const ClientConn *c) {
+#ifdef USE_IOURING
+    return c->rop && c->rop->active;
+#else
+    (void)c;
+    return 0;
+#endif
 }
 
 /* ── reply ordering ─────────────────────────────────────────────────── */
@@ -311,6 +339,9 @@ static void mux_destroy(Worker *w, MuxConn *m) {
         m->pin_client->pin = NULL;
         tx_reset(m->pin_client);
     }
+#ifdef USE_IOURING
+    if (m->uring) uring_detach_mux(w, m); /* takes over buffers the kernel still uses */
+#endif
     if (m->fd >= 0) {
         fd_unwatch(w, m->fd, EL_READABLE | EL_WRITABLE);
         if (m->fd < g_config.max_connection) w->mux_map[m->fd] = NULL;
@@ -326,7 +357,7 @@ static void mux_destroy(Worker *w, MuxConn *m) {
 
 /* Backend connection lost (or node gone): every request still waiting on it
  * gets an error reply, in order, and the mux is freed. */
-static void mux_fail(Worker *w, MuxConn *m, const char *msg) {
+void mux_fail(Worker *w, MuxConn *m, const char *msg) {
     const ClusterNode *nd = &w->topo.nodes[m->node_idx];
     if (m->inflight > 0)
         fprintf(stderr, "[worker %d] backend %s:%d: %s (%d request(s) failed)\n", w->thread_id, nd->ip, nd->port, msg,
@@ -430,7 +461,12 @@ static MuxConn *mux_create(Worker *w, NodePools *np, int db, int resp) {
     w->mux_map[fd] = m;
     /* Writable fires once connect() completes; the TLS handshake (if any)
      * starts from there, and queued commands are flushed after it. */
-    fd_watch(w, fd, EL_READABLE | (m->connecting || m->tls_hs ? EL_WRITABLE : 0));
+#ifdef USE_IOURING
+    if (w->ring && !m->connecting && !m->ssl)
+        uring_attach_mux(w, m);
+    else
+#endif
+        fd_watch(w, fd, EL_READABLE | (m->connecting || m->tls_hs ? EL_WRITABLE : 0));
 
     /* Connection setup rides the same pipeline as the first real commands;
      * these replies are swallowed (see req_deliver()). */
@@ -470,6 +506,12 @@ static MuxConn *mux_for(Worker *w, ClientConn *c, int node_idx) {
 
 static void mux_flush(Worker *w, MuxConn *m) {
     if (m->connecting || m->tls_hs) return; /* handle_mux_writable() flushes once connected */
+#ifdef USE_IOURING
+    if (m->uring) {
+        uring_mux_send(w, m);
+        return;
+    }
+#endif
     while (m->obuf_off < m->obuf_len) {
         int want;
         ssize_t n = net_write(m->fd, m->ssl, m->obuf + m->obuf_off, (size_t)(m->obuf_len - m->obuf_off), &want);
@@ -530,6 +572,13 @@ void handle_mux_writable(Worker *w, MuxConn *m) {
             return;
         }
         m->connecting = 0;
+#ifdef USE_IOURING
+        if (w->ring && !m->ssl) {
+            uring_attach_mux(w, m); /* from here on all I/O is io_uring */
+            mux_flush(w, m);
+            return;
+        }
+#endif
     }
     if (m->tls_hs) {
         if (mux_tls_step(w, m) < 0 || m->tls_hs) return;
@@ -607,6 +656,54 @@ static int mux_try_redirect(Worker *w, MuxConn *m, Req *r, const char *d, int le
     return 1;
 }
 
+/* Routes every complete reply in m->rbuf to its request. Returns -1 if m
+ * failed (and is gone). */
+static int mux_parse_replies(Worker *w, MuxConn *m) {
+    while (m->rbuf_off < m->rbuf_len) {
+        int rl = resp_response_len(m->rbuf + m->rbuf_off, m->rbuf_len - m->rbuf_off);
+        if (rl == 0) {
+            if (m->rbuf_len - m->rbuf_off > MAX_RESP_SIZE) {
+                mux_fail(w, m, "response too large");
+                return -1;
+            }
+            break;
+        }
+        Req *r = m->head;
+        if (rl < 0 || !r) {
+            mux_fail(w, m, "bad backend response");
+            return -1;
+        }
+        m->head = r->mnext;
+        if (!m->head) m->tail = NULL;
+        m->inflight--;
+        r->mnext = NULL;
+        const char *reply = m->rbuf + m->rbuf_off;
+        m->rbuf_off += rl;
+        if (reply[0] == '-' && !r->internal && !m->pin_client && mux_try_redirect(w, m, r, reply, rl)) continue;
+        req_deliver(w, r, reply, rl);
+    }
+    return 0;
+}
+
+#ifdef USE_IOURING
+/* io_uring receive completion: n new bytes landed at rbuf+rbuf_len.
+ * Returns -1 if m is gone. */
+int mux_on_recv(Worker *w, MuxConn *m, int n) {
+    m->rbuf_len += n;
+    if (mux_parse_replies(w, m) < 0) return -1;
+    if (m->draining && m->inflight == 0) {
+        mux_drained(w, m);
+        return m->fd >= 0 && w->mux_map[m->fd] == m ? 0 : -1;
+    }
+    if (m->rbuf_off == m->rbuf_len) m->rbuf_off = m->rbuf_len = 0;
+    if (buf_reserve(&m->rbuf, &m->rbuf_len, &m->rbuf_off, &m->rbuf_cap, IO_CHUNK) < 0) {
+        mux_fail(w, m, "out of memory");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 void handle_mux_readable(Worker *w, MuxConn *m) {
     if (m->connecting) return; /* refused/reset connects are reported via handle_mux_writable() */
     if (m->tls_hs) {
@@ -637,30 +734,7 @@ void handle_mux_readable(Worker *w, MuxConn *m) {
             return;
         }
         m->rbuf_len += (int)n;
-
-        while (m->rbuf_off < m->rbuf_len) {
-            int rl = resp_response_len(m->rbuf + m->rbuf_off, m->rbuf_len - m->rbuf_off);
-            if (rl == 0) {
-                if (m->rbuf_len - m->rbuf_off > MAX_RESP_SIZE) {
-                    mux_fail(w, m, "response too large");
-                    return;
-                }
-                break;
-            }
-            Req *r = m->head;
-            if (rl < 0 || !r) {
-                mux_fail(w, m, "bad backend response");
-                return;
-            }
-            m->head = r->mnext;
-            if (!m->head) m->tail = NULL;
-            m->inflight--;
-            r->mnext = NULL;
-            const char *reply = m->rbuf + m->rbuf_off;
-            m->rbuf_off += rl;
-            if (reply[0] == '-' && !r->internal && !m->pin_client && mux_try_redirect(w, m, r, reply, rl)) continue;
-            req_deliver(w, r, reply, rl);
-        }
+        if (mux_parse_replies(w, m) < 0) return;
         /* Plain TCP: a short read means the socket is drained (edge-
          * triggered, so nothing more until the next edge). */
         if (n < space && net_short_read_drained(m->ssl)) break;
@@ -1259,7 +1333,7 @@ void client_process_input(Worker *w, ClientConn *c) {
         }
 
         if (ci && ci->fast && kl > 0 && !c->in_subscribe && !c->acl_authenticated && !c->sub_conn) {
-            if (c->rq_count >= CLIENT_MAX_INFLIGHT || c->wbuf_len - c->wbuf_off >= CLIENT_MAX_PENDING_OUT ||
+            if (c->rq_count >= CLIENT_MAX_INFLIGHT || client_out_bytes(c) >= CLIENT_MAX_PENDING_OUT ||
                 c->pin_inflight > 0)
                 break;
             c->last_interaction = w->now;
@@ -1286,7 +1360,7 @@ void client_process_input(Worker *w, ClientConn *c) {
         }
 
         /* Legacy command: everything before it must be answered first. */
-        if (c->rq_head || c->wbuf_len > c->wbuf_off) break;
+        if (c->rq_head || client_out_bytes(c) > 0) break;
 
         if (c->hbuf_cap < total) {
             char *tmp = realloc(c->hbuf, (size_t)total);
@@ -1311,7 +1385,9 @@ void client_process_input(Worker *w, ClientConn *c) {
         if (fd >= g_config.max_connection || w->client_map[fd] != c) return; /* closed */
     }
 
-    if (c->ibuf_off == c->ibuf_len) c->ibuf_off = c->ibuf_len = 0;
+    /* With an io_uring receive in flight the kernel writes at ibuf+ibuf_len,
+     * so the buffer can't be rewound under it. */
+    if (c->ibuf_off == c->ibuf_len && !client_recv_inflight(c)) c->ibuf_off = c->ibuf_len = 0;
     if (!incomplete) c->ibuf_need = 0;
     if ((c->ibuf_len > c->ibuf_off && !incomplete) || c->read_paused)
         bl_add(w, c);
@@ -1351,8 +1427,48 @@ void client_tls_continue(Worker *w, ClientConn *c) {
 #endif
 }
 
+#ifdef USE_IOURING
+/* io_uring receive completion: n new bytes landed at ibuf+ibuf_len. Returns
+ * 1 if another receive should be posted, 0 if not (paused / waiting for
+ * buffer space), -1 if c was closed. */
+int client_on_recv(Worker *w, ClientConn *c, int n) {
+    int fd = c->fd;
+    c->ibuf_len += n;
+    client_process_input(w, c);
+    if (fd >= g_config.max_connection || w->client_map[fd] != c) return -1;
+    int unparsed = c->ibuf_len - c->ibuf_off;
+    if (unparsed >= CLIENT_READ_PAUSE && unparsed >= c->ibuf_need) {
+        c->read_paused = 1;
+        bl_add(w, c);
+        return 0;
+    }
+    c->read_paused = 0;
+    return 1;
+}
+
+/* Buffer space for the next io_uring receive; -1 on OOM. */
+int client_recv_reserve(ClientConn *c) {
+    if (c->ibuf_off == c->ibuf_len) c->ibuf_off = c->ibuf_len = 0;
+    int want = IO_CHUNK;
+    if (c->ibuf_need > c->ibuf_len - c->ibuf_off) {
+        int missing = c->ibuf_need - (c->ibuf_len - c->ibuf_off);
+        if (missing > want) want = missing;
+    }
+    return buf_reserve(&c->ibuf, &c->ibuf_len, &c->ibuf_off, &c->ibuf_cap, want);
+}
+#endif
+
 void handle_client_readable(Worker *w, ClientConn *c) {
     int fd = c->fd;
+#ifdef USE_IOURING
+    if (c->uring) { /* only reached from the backlog pass, to resume a paused reader */
+        if (c->read_paused && c->ibuf_len - c->ibuf_off < CLIENT_READ_PAUSE) {
+            c->read_paused = 0;
+            uring_client_recv(w, c);
+        }
+        return;
+    }
+#endif
     if (c->tls_hs) {
         client_tls_continue(w, c);
         return;
@@ -1411,11 +1527,32 @@ void handle_client_readable(Worker *w, ClientConn *c) {
 
 /* ── client output ──────────────────────────────────────────────────── */
 /* Writes as much of c->wbuf as the socket takes. Returns -1 if c was closed. */
+/* All output is on the wire: deferred close, or the end of a legacy reply.
+ * Returns -1 if c was closed. */
+int client_output_drained(Worker *w, ClientConn *c) {
+    if (c->close_after_write && !c->rq_head) { /* the error reply may still be queued behind in-flight ones */
+        close_client(w, c);
+        return -1;
+    }
+    if (c->state == CS_WRITING_RESP) {
+        /* A legacy reply just finished going out. */
+        c->state = CS_READING_HDR;
+        c->hbuf_len = 0;
+        c->using_pbuf = 0;
+        c->pbuf_len = 0;
+        fd_watch(w, c->fd, EL_READABLE);
+    }
+    return 0;
+}
+
 int client_flush(Worker *w, ClientConn *c) {
     if (c->close_asap) {
         close_client(w, c);
         return -1;
     }
+#ifdef USE_IOURING
+    if (c->uring) return uring_client_send(w, c);
+#endif
     if (c->tls_hs) return 0; /* replies wait for the handshake (can't happen in practice) */
     while (c->wbuf_off < c->wbuf_len) {
         int want;
@@ -1435,27 +1572,15 @@ int client_flush(Worker *w, ClientConn *c) {
         c->wbuf_off += (int)n;
     }
     c->wbuf_off = c->wbuf_len = 0;
-    if (c->close_after_write && !c->rq_head) { /* the error reply may still be queued behind in-flight ones */
-        close_client(w, c);
-        return -1;
-    }
     if ((w->fd_mask[c->fd] & EL_WRITABLE) && !c->ssl_read_wants_write) fd_unwatch(w, c->fd, EL_WRITABLE);
-    if (c->state == CS_WRITING_RESP) {
-        /* A legacy reply just finished going out. */
-        c->state = CS_READING_HDR;
-        c->hbuf_len = 0;
-        c->using_pbuf = 0;
-        c->pbuf_len = 0;
-        fd_watch(w, c->fd, EL_READABLE);
-    }
-    return 0;
+    return client_output_drained(w, c);
 }
 
 /* ── per-iteration work ─────────────────────────────────────────────── */
 static int client_input_ready(ClientConn *c) {
     if (c->close_asap || c->close_after_write) return 0;
     if (c->read_paused) return c->ibuf_len - c->ibuf_off < CLIENT_READ_PAUSE;
-    return c->state == CS_READING_HDR && !c->rq_head && c->wbuf_len == c->wbuf_off;
+    return c->state == CS_READING_HDR && !c->rq_head && client_out_bytes(c) == 0;
 }
 
 static void process_backlog(Worker *w) {

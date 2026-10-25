@@ -9,10 +9,16 @@ POOL_CFLAGS  += -DUSE_TLS -I$(OPENSSL_PREFIX)/include
 POOL_LDFLAGS += -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
 endif
 
+# io_uring I/O for plain-TCP sockets (opt-in: make USE_IOURING=1; needs liburing)
+ifneq ($(USE_IOURING),)
+POOL_CFLAGS  += -DUSE_IOURING
+POOL_LDFLAGS += -luring
+endif
+
 POOL_TARGET = valkey-proxy
 POOL_SRCS   = src/valkey-proxy.c src/config.c src/cluster.c src/resp.c \
               src/pool.c src/cmd.c src/fanout.c src/pubsub.c src/acl.c src/client.c \
-              src/hello.c src/event_loop.c src/mux.c src/tls.c
+              src/hello.c src/event_loop.c src/mux.c src/tls.c src/uring.c
 BUILD_DIR   = build
 POOL_OBJS   = $(POOL_SRCS:%.c=$(BUILD_DIR)/%.o)
 
