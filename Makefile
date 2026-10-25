@@ -12,7 +12,7 @@ endif
 POOL_TARGET = valkey-proxy
 POOL_SRCS   = src/valkey-proxy.c src/config.c src/cluster.c src/resp.c \
               src/pool.c src/cmd.c src/fanout.c src/pubsub.c src/acl.c src/client.c \
-              src/hello.c src/event_loop.c
+              src/hello.c src/event_loop.c src/mux.c
 BUILD_DIR   = build
 POOL_OBJS   = $(POOL_SRCS:%.c=$(BUILD_DIR)/%.o)
 
@@ -53,6 +53,7 @@ TEST_SRCS = test/run-test.c test/acl/test_acl.c test/acl/acl_fixture.c test/bitm
             test/stream/test_stream.c \
             test/string/test_string.c \
             test/zset/test_zset.c \
+            test/pipeline/test_pipeline.c \
             test/resp3/test_resp3.c \
             test/modules/bloomfilter/test_bloomfilter.c \
             test/modules/json/test_json.c \

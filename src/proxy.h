@@ -31,7 +31,6 @@
  * whole process: client sockets + backend pool connections + listener(s). */
 #define DEFAULT_MAX_CONNECTIONS 4000
 #define CLUSTER_SLOTS           16384
-#define HDR_BUF_SIZE            16384
 #define MAX_RESP_SIZE           (64 * 1024 * 1024)
 
 #define CLUSTER_NODES_CMD "*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n"
@@ -78,6 +77,8 @@ typedef struct ConnPool ConnPool;
 typedef struct ClientConn ClientConn;
 typedef struct FanoutSub FanoutSub;
 typedef struct FanoutCtx FanoutCtx;
+typedef struct MuxConn MuxConn;
+typedef struct Req Req;
 
 /* ── pool connection ────────────────────────────────────────────────── */
 typedef enum { CONN_AVAILABLE = 0, CONN_IN_USE = 1 } ConnState;
@@ -152,13 +153,45 @@ struct ConnPool {
     int wait_len, wait_cap;
 };
 
+/* ── multiplexed backend connection (see src/mux.c) ─────────────────────
+ * One long-lived, pipelined connection per (worker, db, node, RESP version)
+ * carrying every fast-path command from every client on that worker.
+ * Replies come back in send order, so the in-flight Req FIFO is all that's
+ * needed to route each one back to its client. */
+struct Req {
+    ClientConn *client; /* NULL = internal (SELECT/HELLO) or client already closed */
+    Req *cnext;         /* next in client's reply-order queue */
+    Req *mnext;         /* next in mux in-flight FIFO (or worker freelist) */
+    int done;           /* reply arrived (held in reply[]) before earlier ones */
+    int internal;
+    char *reply;
+    int reply_len;
+};
+
+struct MuxConn {
+    int fd;
+    int node_idx, db, resp;
+    int connecting; /* non-blocking connect() still in progress */
+    int draining;   /* node identity moved on: no new requests, close once idle */
+    struct NodePools *owner;
+    char *obuf;
+    int obuf_len, obuf_off, obuf_cap;
+    char *rbuf;
+    int rbuf_len, rbuf_off, rbuf_cap;
+    Req *head, *tail;
+    int inflight;
+    MuxConn *pf_prev, *pf_next; /* worker's pending-flush list */
+    int in_pf;
+};
+
 /* gen mirrors the owning Worker's topo.node_gen[node_idx] as of the last time
  * this NodePools was (re)synced -- see worker_sync_topology(). -1 means this
  * index has never been backed by a live shard yet (no pools initialized). */
-typedef struct {
+typedef struct NodePools {
     int node_idx;
     int gen;
     ConnPool pools[POOL_TYPE_COUNT];
+    MuxConn *mux[2]; /* [0] = RESP2, [1] = RESP3; created lazily */
 } NodePools;
 typedef struct {
     int db;
@@ -170,8 +203,27 @@ struct ClientConn {
     int fd, db;
     int in_transaction, in_subscribe;
     ClientState state;
-    char hbuf[HDR_BUF_SIZE];
-    int hbuf_len;
+    /* Raw input as read off the socket; may hold many pipelined commands
+     * (see client_process_input() in mux.c). */
+    char *ibuf;
+    int ibuf_len, ibuf_off, ibuf_cap;
+    int ibuf_need;   /* bytes the next, still-incomplete command needs */
+    int read_paused; /* stopped reading: too much unparsed input buffered */
+    /* Fast-path requests not yet answered to the client, in command order. */
+    Req *rq_head, *rq_tail;
+    int rq_count;
+    int close_asap;        /* close at the next flush (OOM etc.) */
+    int close_after_write; /* close once wbuf is fully flushed */
+    ClientConn *pw_prev, *pw_next; /* worker's pending-write list */
+    int in_pw;
+    ClientConn *bl_prev, *bl_next; /* worker's input-backlog list */
+    int in_bl;
+    int fast_db; /* db fast_np was looked up for */
+    NodePools *fast_np;
+    /* Exactly one complete command, handed to the legacy (non-fast-path)
+     * handlers -- see legacy_dispatch() in client.c. */
+    char *hbuf;
+    int hbuf_len, hbuf_cap;
     int node_idx;
     int total_cmd_len;
     long long cmd_remaining;
@@ -300,6 +352,14 @@ typedef struct {
      * published, instead of waiting for it to next wake up on its own via
      * client/backend traffic. -1 until worker_thread() sets it up. */
     int wake_r, wake_w;
+    /* ── pipelined fast path (see src/mux.c) ── */
+    MuxConn **mux_map;
+    Req *req_free;
+    MuxConn *pf_head;   /* muxes with unsent output */
+    ClientConn *pw_head; /* clients with unsent output */
+    ClientConn *bl_head; /* clients with buffered, unprocessed input */
+    unsigned close_seq;  /* bumped by close_client() */
+    time_t now;
 } Worker;
 
 typedef struct {
@@ -323,6 +383,8 @@ typedef struct {
      * seconds -- unlike the one-shot startup discovery, which uses a fixed,
      * more generous timeout since it blocks nothing but its own boot. */
     int backend_connect_timeout_ms;
+    int verbose; /* "verbose yes": per-command/per-connection logging */
+    int max_command_size; /* largest single client command accepted */
 } Config;
 
 /* ── globals ────────────────────────────────────────────────────────── */
@@ -360,6 +422,14 @@ extern int g_tcp_fd, g_unix_fd;
 #ifdef USE_TLS
 extern SSL_CTX *g_ssl_ctx;
 #endif
+
+/* Per-command / per-connection trace logging. Off by default: these fire on
+ * every acquire/release and every accept, and unconditional stdout writes
+ * there cost more than the proxying itself under load. */
+#define LOG_VERBOSE(...)                        \
+    do {                                        \
+        if (g_config.verbose) printf(__VA_ARGS__); \
+    } while (0)
 
 /* ── event mask helpers ─────────────────────────────────────────────── */
 static inline void fd_watch(Worker *w, int fd, int events) {
@@ -444,6 +514,15 @@ DbGroup *db_group_get(Worker *w, int db);
 void worker_sync_topology(Worker *w);
 
 /* ── command routing ────────────────────────────────────────────────── */
+typedef struct {
+    const char *name;
+    PoolType pool;
+    CmdClass cls;
+    int container;
+    int fast; /* eligible for the pipelined single-key fast path */
+} CmdInfo;
+void cmd_info_init(void);
+const CmdInfo *cmd_info(const char *cmd); /* NULL = unsupported */
 PoolType cmd_get_pool_type(const char *cmd);
 int cmd_in_list(const char *cmd, const char **list);
 int cmd_is_supported(const char *cmd);
@@ -479,6 +558,22 @@ void client_recover_after_backend_error(Worker *w, ClientConn *client, PoolConn 
  * function to call client_send_error()+close_client() itself (caller must
  * return immediately without touching cl or conn again). */
 int deliver_backend_reply(Worker *w, ClientConn *cl, PoolConn *conn, const char *buf, int len);
+
+/* Run cmd (already complete in client->hbuf, upper-cased name in cmd)
+ * through the original one-command-at-a-time state machine. */
+void legacy_dispatch(Worker *w, ClientConn *client, char *cmd, int cmdlen, char *key, int keylen, int argc,
+                     int total_cmd_len);
+
+/* ── pipelined fast path (src/mux.c) ───────────────────────────────── */
+void client_process_input(Worker *w, ClientConn *client);
+int client_flush(Worker *w, ClientConn *client);
+void client_detach_requests(Worker *w, ClientConn *client);
+void client_list_unlink(Worker *w, ClientConn *client);
+void handle_mux_readable(Worker *w, MuxConn *m);
+void handle_mux_writable(Worker *w, MuxConn *m);
+void mux_node_changed(Worker *w, NodePools *np, int still_owns_slots);
+void worker_after_events(Worker *w);
+int worker_has_ready_backlog(Worker *w);
 
 /* ── backend / client event handlers ───────────────────────────────── */
 void handle_backend_writable(Worker *w, PoolConn *conn);

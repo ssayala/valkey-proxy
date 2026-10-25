@@ -17,6 +17,9 @@ void client_send_crossslot(ClientConn *client) {
 
 void close_client(Worker *w, ClientConn *client) {
     int fd = client->fd;
+    w->close_seq++;
+    client_list_unlink(w, client);
+    client_detach_requests(w, client);
     fd_unwatch(w, fd, EL_READABLE | EL_WRITABLE);
     if (fd >= 0 && fd < g_config.max_connection) w->client_map[fd] = NULL;
     if (client->state == CS_WAITING_CONN && client->waiting_pool) {
@@ -65,6 +68,8 @@ void close_client(Worker *w, ClientConn *client) {
     acl_teardown_all(w, client);
     free(client->wbuf);
     free(client->pbuf);
+    free(client->ibuf);
+    free(client->hbuf);
 #ifdef USE_TLS
     if (client->ssl) {
         SSL_free(client->ssl);
@@ -198,7 +203,7 @@ void resume_client_after_conn(Worker *w, ClientConn *client, PoolConn *conn) {
         return;
     }
     const ClusterNode *nd = &w->topo.nodes[conn->pool->node_idx];
-    printf("[worker %d] [pool:%s] acquire  fd=%-4d  node=%s:%d  db=%d  in-use=%d/%d  client-fd=%d\n", w->thread_id,
+    LOG_VERBOSE("[worker %d] [pool:%s] acquire  fd=%-4d  node=%s:%d  db=%d  in-use=%d/%d  client-fd=%d\n", w->thread_id,
            POOL_NAME[conn->pool->type], conn->fd, nd->ip, nd->port, conn->db, conn->pool->count, conn->pool->max,
            client->fd);
 
@@ -403,174 +408,30 @@ void handle_backend_readable(Worker *w, PoolConn *conn) {
 
 /* ── client writable: flush response buffer ─────────────────────────── */
 void handle_client_writable(Worker *w, ClientConn *client) {
-    if (!client->wbuf || client->wbuf_len == 0) {
+    if (!client->wbuf || client->wbuf_len == client->wbuf_off) {
+        client->wbuf_len = client->wbuf_off = 0;
         fd_unwatch(w, client->fd, EL_WRITABLE);
         fd_watch(w, client->fd, EL_READABLE);
         client->state = CS_READING_HDR;
         return;
     }
-    ssize_t n = write(client->fd, client->wbuf + client->wbuf_off, (size_t)(client->wbuf_len - client->wbuf_off));
-    if (n < 0) {
-        if (errno == EAGAIN) return;
-        close_client(w, client);
-        return;
-    }
-    client->wbuf_off += (int)n;
-    if (client->wbuf_off >= client->wbuf_len) {
-        client->wbuf_len = 0;
-        client->wbuf_off = 0;
-        fd_unwatch(w, client->fd, EL_WRITABLE);
-        fd_watch(w, client->fd, EL_READABLE);
-        client->state = CS_READING_HDR;
-        client->hbuf_len = 0;
-        client->using_pbuf = 0;
-        client->pbuf_len = 0;
-    }
+    if (client_flush(w, client) < 0) return;
+    if (client->wbuf_len > 0) return; /* socket full again; still watching writable */
+    fd_watch(w, client->fd, EL_READABLE);
+    client->state = CS_READING_HDR;
+    client->hbuf_len = 0;
+    client->using_pbuf = 0;
+    client->pbuf_len = 0;
 }
 
-/* ── client readable: parse and dispatch ────────────────────────────── */
-void handle_client_readable(Worker *w, ClientConn *client) {
-    /* ── CS_STREAMING_CMD: forward cmd body bytes to backend ── */
-    if (client->state == CS_STREAMING_CMD) {
-        if (!client->pending_conn) {
-            close_client(w, client);
-            return;
-        }
-        PoolConn *conn = client->pending_conn;
-
-        /* Drain everything already buffered for this client fd in one go
-         * (edge-triggered epoll won't re-notify for a burst that already
-         * arrived just because our per-call cap didn't fully consume it). */
-        while (client->cmd_remaining > 0) {
-            int want = (int)(client->cmd_remaining < 65536 ? client->cmd_remaining : 65536);
-            if (conn->wbuf_cap < conn->wbuf_len + want) {
-                int nc = conn->wbuf_len + want + 4096;
-                char *tmp = realloc(conn->wbuf, (size_t)nc);
-                if (!tmp) {
-                    close_client(w, client);
-                    return;
-                }
-                conn->wbuf = tmp;
-                conn->wbuf_cap = nc;
-            }
-            ssize_t n = read(client->fd, conn->wbuf + conn->wbuf_len, (size_t)want);
-            if (n < 0) {
-                if (errno == EAGAIN) {
-                    fd_watch(w, conn->fd, EL_WRITABLE);
-                    return;
-                }
-                close_client(w, client);
-                return;
-            }
-            if (n == 0) {
-                close_client(w, client);
-                return;
-            }
-            conn->wbuf_len += (int)n;
-            client->cmd_remaining -= n;
-        }
-
-        fd_watch(w, conn->fd, EL_WRITABLE);
-        client->state = CS_WAITING_RESP;
-        fd_unwatch(w, client->fd, EL_READABLE);
-        return;
-    }
-
-    /* ── CS_BUFFERING_CMD: accumulate multi-key command ── */
-    if (client->state == CS_BUFFERING_CMD) {
-        /* Drain everything already buffered for this client fd in one go
-         * (edge-triggered epoll won't re-notify for a burst that already
-         * arrived just because our per-call cap didn't fully consume it). */
-        int rlen;
-        for (;;) {
-            if (client->pbuf_cap - client->pbuf_len < 4096) {
-                int nc = client->pbuf_cap ? client->pbuf_cap * 2 : 4096;
-                if (nc > g_config.max_multikey_payload) {
-                    client_send_error(w, client, "command too large");
-                    client->pbuf_len = 0;
-                    client->state = CS_READING_HDR;
-                    fd_watch(w, client->fd, EL_READABLE);
-                    return;
-                }
-                char *tmp = realloc(client->pbuf, (size_t)nc);
-                if (!tmp) {
-                    close_client(w, client);
-                    return;
-                }
-                client->pbuf = tmp;
-                client->pbuf_cap = nc;
-            }
-            ssize_t n =
-                read(client->fd, client->pbuf + client->pbuf_len, (size_t)(client->pbuf_cap - client->pbuf_len));
-            if (n < 0) {
-                if (errno == EAGAIN) return;
-                close_client(w, client);
-                return;
-            }
-            if (n == 0) {
-                close_client(w, client);
-                return;
-            }
-            client->pbuf_len += (int)n;
-
-            rlen = resp_response_len(client->pbuf, client->pbuf_len);
-            if (rlen != 0) break;
-            /* rlen==0: incomplete, keep draining the socket */
-        }
-
-        if (rlen > 0) {
-            char cmd2[64] = "", key2[512] = "";
-            int cl2 = 0, kl2 = 0, ac2 = 0, tc2 = 0;
-            resp_parse_header(client->pbuf, client->pbuf_len, cmd2, &cl2, key2, &kl2, &ac2, &tc2);
-            PoolType pt2 = cmd_get_pool_type(cmd2);
-            if (pt2 == POOL_BLOCKING)
-                handle_blocking_complete(w, client, cmd2);
-            else if (pt2 == POOL_ACL)
-                handle_auth_cmd(w, client);
-            else
-                handle_multikey_complete(w, client, cmd2);
-        }
-        return;
-    }
-
-    /* ── CS_READING_HDR: read and parse command header ── */
-    /* Drain everything already buffered for this client fd in one go
-     * (edge-triggered epoll won't re-notify for a burst that already
-     * arrived just because our per-call cap didn't fully consume it). */
-    char cmd[64] = "", key[512] = "";
-    int cmdlen = 0, keylen = 0, argc = 0, total_cmd_len = 0;
-    int consumed;
-    for (;;) {
-        int avail = HDR_BUF_SIZE - client->hbuf_len;
-        if (avail <= 0) {
-            client_send_error(w, client, "command header too large");
-            close_client(w, client);
-            return;
-        }
-
-        ssize_t n = read(client->fd, client->hbuf + client->hbuf_len, (size_t)avail);
-        if (n < 0) {
-            if (errno == EAGAIN) return;
-            close_client(w, client);
-            return;
-        }
-        if (n == 0) {
-            close_client(w, client);
-            return;
-        }
-        client->hbuf_len += (int)n;
-
-        consumed = resp_parse_header(client->hbuf, client->hbuf_len, cmd, &cmdlen, key, &keylen, &argc, &total_cmd_len);
-        if (consumed != 0) break;
-        /* consumed==0: header incomplete, keep draining the socket */
-    }
-    if (consumed < 0) {
-        client_send_error(w, client, "protocol error");
-        close_client(w, client);
-        return;
-    }
-
-    str_toupper(cmd);
+/* ── legacy dispatch ────────────────────────────────────────────────── */
+/* The original one-command-at-a-time state machine, for everything the
+ * pipelined fast path (mux.c) doesn't handle. client_process_input() only
+ * calls this with the complete command in client->hbuf (hbuf_len ==
+ * total_cmd_len) and nothing else outstanding for the client. */
+void legacy_dispatch(Worker *w, ClientConn *client, char *cmd, int cmdlen, char *key, int keylen, int argc,
+                     int total_cmd_len) {
+    (void)cmdlen;
     PoolType pt = route_command(client, cmd);
     CmdClass cls = classify_command(cmd, pt);
     client->total_cmd_len = total_cmd_len;
@@ -580,29 +441,10 @@ void handle_client_readable(Worker *w, ClientConn *client) {
         client->hbuf_len = 0;
         return;
     }
-
-    /* HELLO's AUTH/SETNAME clauses end the command, and resp_parse_header()
-     * doesn't wait for the last argument's bytes -- read until the whole
-     * (always small) command is in hbuf before dispatching it. */
-    if (!strcmp(cmd, "HELLO") && client->hbuf_len < total_cmd_len) {
-        if (total_cmd_len > HDR_BUF_SIZE) {
-            client_send_error(w, client, "command header too large");
-            close_client(w, client);
-            return;
-        }
-        while (client->hbuf_len < total_cmd_len) {
-            ssize_t n = read(client->fd, client->hbuf + client->hbuf_len, (size_t)(HDR_BUF_SIZE - client->hbuf_len));
-            if (n < 0) {
-                if (errno == EAGAIN) return;
-                close_client(w, client);
-                return;
-            }
-            if (n == 0) {
-                close_client(w, client);
-                return;
-            }
-            client->hbuf_len += (int)n;
-        }
+    if ((cls == CMD_CLASS_MULTI_KEY || cls == CMD_CLASS_BLOCKING) && total_cmd_len > g_config.max_multikey_payload) {
+        client_send_error(w, client, "command too large");
+        client->hbuf_len = 0;
+        return;
     }
 
     /* ── CLIENT INFO bookkeeping: this is the single dispatch point shared by

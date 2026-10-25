@@ -153,7 +153,7 @@ PoolConn *pool_acquire_nb(Worker *w, ConnPool *p) {
             c->acl_hello_resp3 = 0;
             c->discard_on_release = 0;
             if (fd < g_config.max_connection) w->backend_map[fd] = c;
-            printf("  [%s pool] node [%s:%d] db=%d: new conn fd=%d (%d/%d)\n", POOL_NAME[p->type], node->ip, node->port,
+            LOG_VERBOSE("  [%s pool] node [%s:%d] db=%d: new conn fd=%d (%d/%d)\n", POOL_NAME[p->type], node->ip, node->port,
                    p->db, fd, p->count + 1, p->max);
             p->count++;
             return c;
@@ -272,7 +272,7 @@ void pool_release(Worker *w, PoolConn *c) {
         ClientConn *next = p->wait_queue[0];
         memmove(p->wait_queue, p->wait_queue + 1, (size_t)(p->wait_len - 1) * sizeof(ClientConn *));
         p->wait_len--;
-        printf("[worker %d] [pool:%s] release  fd=%-4d  node=%s:%d  db=%d  → reassigned to client-fd=%d  (queue=%d)\n",
+        LOG_VERBOSE("[worker %d] [pool:%s] release  fd=%-4d  node=%s:%d  db=%d  → reassigned to client-fd=%d  (queue=%d)\n",
                w->thread_id, POOL_NAME[p->type], c->fd, nd->ip, nd->port, c->db, next->fd, p->wait_len);
         c->waiting_client = next;
         c->epoch++;
@@ -282,9 +282,10 @@ void pool_release(Worker *w, PoolConn *c) {
         c->state = CONN_AVAILABLE;
         c->waiting_client = NULL;
         int avail = 0;
-        for (int i = 0; i < p->count; i++)
-            if (p->conns[i].state == CONN_AVAILABLE) avail++;
-        printf("[worker %d] [pool:%s] release  fd=%-4d  node=%s:%d  db=%d  → available=%d  max=%d  waiting=%d\n",
+        if (g_config.verbose)
+            for (int i = 0; i < p->count; i++)
+                if (p->conns[i].state == CONN_AVAILABLE) avail++;
+        LOG_VERBOSE("[worker %d] [pool:%s] release  fd=%-4d  node=%s:%d  db=%d  → available=%d  max=%d  waiting=%d\n",
                w->thread_id, POOL_NAME[p->type], c->fd, nd->ip, nd->port, c->db, avail, p->max, p->wait_len);
     }
 }
@@ -294,7 +295,7 @@ void pool_destroy_conn(Worker *w, PoolConn *c) {
     ConnPool *p = c->pool;
     const ClusterNode *nd = &w->topo.nodes[p->node_idx];
 
-    printf("[worker %d] [pool:%s] destroy  fd=%-4d  node=%s:%d  db=%d  (pool count: %d→%d)\n", w->thread_id,
+    LOG_VERBOSE("[worker %d] [pool:%s] destroy  fd=%-4d  node=%s:%d  db=%d  (pool count: %d→%d)\n", w->thread_id,
            POOL_NAME[p->type], c->fd, nd->ip, nd->port, c->db, p->count, p->count - 1);
 
     fd_unwatch(w, c->fd, EL_READABLE | EL_WRITABLE);
@@ -496,6 +497,7 @@ void worker_sync_topology(Worker *w) {
                     else if (p->wait_len > 0)
                         pool_fail_all_waiters(w, p, "backend node unavailable");
                 }
+                mux_node_changed(w, np, still_owns_slots);
                 np->gen = w->topo.node_gen[idx];
             }
         }

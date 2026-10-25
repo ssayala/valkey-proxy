@@ -15,6 +15,7 @@ void parse_conf(const char *path) {
     g_config.cluster_refresh_interval_ms = 0; /* 0 = periodic refresh disabled */
     g_config.cluster_node_fail_grace_ms = 10000;
     g_config.backend_connect_timeout_ms = 1000;
+    g_config.max_command_size = 512 * 1024 * 1024;
     char line[512], key[64], val[448];
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
@@ -47,6 +48,10 @@ void parse_conf(const char *path) {
             g_config.cluster_refresh_interval_ms = atoi(val);
         else if (!strcmp(key, "cluster_node_fail_grace_ms"))
             g_config.cluster_node_fail_grace_ms = atoi(val);
+        else if (!strcmp(key, "max_command_size"))
+            g_config.max_command_size = atoi(val);
+        else if (!strcmp(key, "verbose"))
+            g_config.verbose = (!strcmp(val, "yes"));
         else if (!strcmp(key, "backend_connect_timeout_ms"))
             g_config.backend_connect_timeout_ms = atoi(val);
         else if (!strcmp(key, "min_normal_connection"))

@@ -489,3 +489,54 @@ CmdClass classify_command(const char *cmd, PoolType pt) {
         if (!strcmp(cmd, NO_KEY_CMDS[i])) return CMD_CLASS_NO_KEY;
     return CMD_CLASS_SINGLE_KEY;
 }
+
+/* ── per-command info cache ─────────────────────────────────────────────
+ * The lists above are scanned linearly (cmd_is_supported() alone walks
+ * ~250 strcmp()s), which is fine for the legacy per-command state machine
+ * but not for the pipelined fast path (see mux.c), which looks every
+ * command up. Every supported command's routing facts are precomputed once
+ * at startup into a small open-addressing hash table keyed by the
+ * upper-cased command name; it's read-only after cmd_info_init(), so
+ * worker threads share it without locking. */
+#define CMD_INFO_BUCKETS 1024 /* power of two, comfortably > 2x the command count */
+
+static CmdInfo g_cmd_info[CMD_INFO_BUCKETS];
+
+static uint32_t cmd_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+    return h;
+}
+
+static void cmd_info_add(const char *name) {
+    uint32_t i = cmd_hash(name) & (CMD_INFO_BUCKETS - 1);
+    while (g_cmd_info[i].name) {
+        if (!strcmp(g_cmd_info[i].name, name)) return;
+        i = (i + 1) & (CMD_INFO_BUCKETS - 1);
+    }
+    CmdInfo *ci = &g_cmd_info[i];
+    ci->name = name;
+    ci->pool = cmd_get_pool_type(name);
+    ci->cls = classify_command(name, ci->pool);
+    ci->container = cmd_in_list(name, CONTAINER_CMDS);
+    /* Plain "route by arg[1]'s slot, relay the reply verbatim" commands.
+     * Container commands are excluded because several (OBJECT, XGROUP,
+     * XINFO, MEMORY) take their key from arg[2] or special-case HELP -- see
+     * legacy_dispatch() in client.c. */
+    ci->fast = ci->pool == POOL_NORMAL && ci->cls == CMD_CLASS_SINGLE_KEY && !ci->container;
+}
+
+void cmd_info_init(void) {
+    const char **lists[] = {NON_TXN_CMDS, TXN_CMDS, PUBSUB_CMDS};
+    for (size_t l = 0; l < sizeof(lists) / sizeof(lists[0]); l++)
+        for (int i = 0; lists[l][i]; i++) cmd_info_add(lists[l][i]);
+}
+
+const CmdInfo *cmd_info(const char *cmd) {
+    uint32_t i = cmd_hash(cmd) & (CMD_INFO_BUCKETS - 1);
+    while (g_cmd_info[i].name) {
+        if (!strcmp(g_cmd_info[i].name, cmd)) return &g_cmd_info[i];
+        i = (i + 1) & (CMD_INFO_BUCKETS - 1);
+    }
+    return NULL;
+}

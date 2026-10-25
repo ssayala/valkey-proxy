@@ -852,9 +852,8 @@ static char *fanout_agg_function_stats(Worker *w, FanoutCtx *ctx, int *out_len) 
 }
 
 /* ── COMMAND INFO reply post-processing ─────────────────────────────── */
-/* Defensive cap on the temporary pointer arrays below; HDR_BUF_SIZE (16384
- * bytes) bounds how many RESP args a single request can carry, which is
- * far below this, so it's never actually hit. */
+/* Cap on the temporary pointer arrays below; entries past it are dropped
+ * (n is clamped at every use), far more than any real COMMAND INFO asks for. */
 #define CMD_INFO_MAX_ENTRIES 2048
 
 static int command_info_name_supported(const char *name, int namelen) {

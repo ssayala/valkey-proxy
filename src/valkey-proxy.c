@@ -1,5 +1,6 @@
 #include "proxy.h"
 #include <sys/resource.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 
 /* ── global definitions ─────────────────────────────────────────────── */
@@ -92,6 +93,10 @@ static void do_accept(Worker *w, int listen_fd) {
             continue;
         }
         set_nonblocking(fd);
+        if (sa.ss_family == AF_INET || sa.ss_family == AF_INET6) {
+            int one = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        }
 
         ClientConn *client = calloc(1, sizeof(ClientConn));
         if (!client) {
@@ -134,10 +139,10 @@ static void do_accept(Worker *w, int listen_fd) {
 #endif
 
         if (sa.ss_family == AF_INET || sa.ss_family == AF_INET6) {
-            printf("[worker %d] client connected: %s  fd=%d%s\n", w->thread_id, client->addr, fd,
+            LOG_VERBOSE("[worker %d] client connected: %s  fd=%d%s\n", w->thread_id, client->addr, fd,
                    g_config.tls_enabled ? "  (TLS)" : "");
         } else {
-            printf("[worker %d] client connected: unix socket  fd=%d\n", w->thread_id, fd);
+            LOG_VERBOSE("[worker %d] client connected: unix socket  fd=%d\n", w->thread_id, fd);
         }
         w->client_map[fd] = client;
         fd_watch(w, fd, EL_READABLE);
@@ -154,7 +159,8 @@ static void *worker_thread(void *arg) {
     w->client_map = calloc((size_t)g_config.max_connection, sizeof(*w->client_map));
     w->backend_map = calloc((size_t)g_config.max_connection, sizeof(*w->backend_map));
     w->fd_mask = calloc((size_t)g_config.max_connection, sizeof(*w->fd_mask));
-    if (!w->client_map || !w->backend_map || !w->fd_mask) {
+    w->mux_map = calloc((size_t)g_config.max_connection, sizeof(*w->mux_map));
+    if (!w->client_map || !w->backend_map || !w->fd_mask || !w->mux_map) {
         fprintf(stderr, "out of memory allocating connection tables (max_connection=%d)\n", g_config.max_connection);
         return NULL;
     }
@@ -205,8 +211,9 @@ static void *worker_thread(void *arg) {
     db_group_get(w, g_config.db);
 
     while (1) {
-        int n = el_poll(w->el, -1);
+        int n = el_poll(w->el, worker_has_ready_backlog(w) ? 0 : -1);
         if (n < 0) break;
+        w->now = time(NULL);
         if (w->topology_version_seen != topology_version_load()) worker_sync_topology(w);
         for (int i = 0; i < n; i++) {
             int fd = w->el->fired[i].fd;
@@ -238,8 +245,13 @@ static void *worker_thread(void *arg) {
                  * longer the one this event was originally reported for. */
                 if (pc == w->backend_map[fd] && pc->epoch == epoch && (mask & EL_READABLE))
                     handle_backend_readable(w, pc);
+            } else if (w->mux_map[fd]) {
+                MuxConn *m = w->mux_map[fd];
+                if (mask & EL_WRITABLE) handle_mux_writable(w, m);
+                if (m == w->mux_map[fd] && (mask & EL_READABLE)) handle_mux_readable(w, m);
             }
         }
+        worker_after_events(w);
     }
     return NULL;
 }
@@ -258,6 +270,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     parse_conf(conf_path);
+    cmd_info_init();
     adjust_open_files_limit();
 
     memset(g_slot_map, -1, sizeof(g_slot_map));

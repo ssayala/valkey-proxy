@@ -21,6 +21,7 @@ void run_pubsub_tests(const char *host, int port, int *pass, int *fail);
 void run_acl_tests(const char *host, int port, int *pass, int *fail);
 void run_resp3_tests(const char *host, int port, int *pass, int *fail);
 void run_search_tests(const char *host, int port, int *pass, int *fail);
+void run_pipeline_tests(const char *host, int port, int *pass, int *fail);
 int test_acl_fixture_setup(const char *seed);
 void test_acl_fixture_teardown(void);
 extern const char *g_test_acl_user;
@@ -118,6 +119,7 @@ int main(int argc, char *argv[]) {
         RUN_SUITE("stream", run_stream_tests);
         RUN_SUITE("zset", run_zset_tests);
         RUN_SUITE("blocking", run_blocking_tests);
+        RUN_SUITE("pipeline", run_pipeline_tests);
         RUN_SUITE("pubsub", run_pubsub_tests);
         RUN_SUITE("acl", run_acl_tests);
         /* Must run last: this is the one suite that actually triggers the
