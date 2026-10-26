@@ -605,6 +605,11 @@ int backend_connect_blocking(const char *ip, int port, const struct sockaddr_sto
 
 /* ── cluster ────────────────────────────────────────────────────────── */
 void fetch_cluster_nodes(void);
+/* Parses a CLUSTER NODES reply body, received from src_ip, into
+ * out_nodes/out_slot (masters only; out_slot pre-filled with -1 by the
+ * caller). */
+void parse_cluster_nodes_into(const char *data, const char *src_ip, ClusterNode *out_nodes, int *out_count, int *out_slot,
+                              int verbose);
 int key_slot(const char *key, int klen);
 void topology_start_refresh_thread(void);
 /* Ask the refresh thread for an immediate CLUSTER NODES refresh (e.g. after a
@@ -622,6 +627,12 @@ static inline int backend_resp3_active_load(void) {
 }
 
 /* ── RESP protocol ──────────────────────────────────────────────────── */
+/* Client input framing (mux.c): scan_command() frames one RESP multibulk
+ * command, inline_to_resp() converts an inline command line into RESP in
+ * c->conv; see their definitions for the return values. */
+int scan_command(const char *buf, int len, const char **cmd, int *cmdlen, const char **key, int *keylen, int *argc_out,
+                 long long *total, long long *need);
+int inline_to_resp(ClientConn *c, const char *line, int len);
 int resp_parse_header(const char *buf, int len, char *cmd, int *cmdlen_out, char *key, int *keylen_out, int *argc_out,
                       int *total_cmd_len_out);
 int resp_response_len(const char *buf, int len);

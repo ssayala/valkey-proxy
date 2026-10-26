@@ -57,14 +57,38 @@ static int has_flag(const char *flags, const char *want) {
 }
 
 /* ── CLUSTER NODES ──────────────────────────────────────────────────── */
+/* One slot token [s, e): "N" or "N-M" with 0 <= N <= M < CLUSTER_SLOTS. */
+static int parse_slot_num(const char **p, const char *e, int *out) {
+    int v = 0, digits = 0;
+    for (; *p < e && **p >= '0' && **p <= '9'; (*p)++) {
+        v = v * 10 + (**p - '0');
+        if (v >= CLUSTER_SLOTS) return -1;
+        digits++;
+    }
+    *out = v;
+    return digits ? 0 : -1;
+}
+
+static int parse_slot_range(const char *s, const char *e, int *lo, int *hi) {
+    if (parse_slot_num(&s, e, lo) < 0) return -1;
+    *hi = *lo;
+    if (s < e && *s == '-') {
+        s++;
+        if (parse_slot_num(&s, e, hi) < 0) return -1;
+    }
+    return (s == e && *lo <= *hi) ? 0 : -1;
+}
+
 /* Parses into caller-owned buffers instead of the global topology, so both
  * the one-shot startup discovery and the periodic background refresh can
  * share this without either one touching live global state mid-parse.
  * out_slot must already be initialized (typically all -1) by the caller. */
-static void parse_cluster_nodes_into(const char *data, ClusterNode *out_nodes, int *out_count, int *out_slot,
-                                     int verbose) {
-    char buf[65536];
-    snprintf(buf, sizeof(buf), "%s", data);
+void parse_cluster_nodes_into(const char *data, const char *src_ip, ClusterNode *out_nodes, int *out_count, int *out_slot,
+                              int verbose) {
+    /* a copy of the whole reply: a large cluster's reply can run to hundreds
+     * of KB, and a fixed buffer would silently drop the nodes past its end */
+    char *buf = strdup(data);
+    if (!buf) return;
     char *p = buf;
     while (*p && *out_count < MAX_NODES) {
         char *eol = strchr(p, '\n');
@@ -123,7 +147,10 @@ static void parse_cluster_nodes_into(const char *data, ClusterNode *out_nodes, i
         }
         *colon = '\0';
         int nport = atoi(colon + 1);
-        const char *connect_host = addr[0] ? addr : hostname;
+        /* A node that has never met another one (a single-node cluster)
+         * doesn't know its own address and reports ":port": it's the node
+         * this reply came from, so use the address we reached it on. */
+        const char *connect_host = addr[0] ? addr : hostname[0] ? hostname : has_flag(flags, "myself") ? src_ip : "";
         struct sockaddr_storage nsa;
         socklen_t nsalen = 0;
         if (!connect_host[0] || nport == 0 || resolve_addr(connect_host, nport, &nsa, &nsalen) < 0) {
@@ -143,29 +170,22 @@ static void parse_cluster_nodes_into(const char *data, ClusterNode *out_nodes, i
         snprintf(nd->flags, sizeof(nd->flags), "%.127s", flags);
         nd->is_master = 1;
 
-        /* parse slot ranges */
+        /* parse slot ranges: "N" or "N-M"; anything else, such as a
+         * migrating/importing entry "[N->-id]" / "[N-<-id]", is skipped whole */
         const char *tp = p + nc;
         while (*tp) {
             while (*tp == ' ' || *tp == '\t') tp++;
             if (!*tp) break;
-            char tok[32];
-            int ti = 0;
-            while (*tp && *tp != ' ' && *tp != '\t' && ti < 31) tok[ti++] = *tp++;
-            tok[ti] = '\0';
-            if (tok[0] == '[') continue;
-            char *dash = strchr(tok, '-');
-            if (dash) {
-                int s = atoi(tok), e = atoi(dash + 1);
-                if (s >= 0 && e < CLUSTER_SLOTS && s <= e)
-                    for (int x = s; x <= e; x++) out_slot[x] = ni;
-            } else {
-                int s = atoi(tok);
-                if (s >= 0 && s < CLUSTER_SLOTS) out_slot[s] = ni;
-            }
+            const char *ts = tp;
+            while (*tp && *tp != ' ' && *tp != '\t') tp++;
+            int lo, hi;
+            if (parse_slot_range(ts, tp, &lo, &hi) == 0)
+                for (int x = lo; x <= hi; x++) out_slot[x] = ni;
         }
         if (eol) *eol = saved;
         p = eol ? eol + 1 : p + strlen(p);
     }
+    free(buf);
 }
 
 /* Connect to ip:port, run CLUSTER NODES, parse into caller-owned buffers.
@@ -205,7 +225,7 @@ static int fetch_cluster_nodes_from(const char *ip, int port, ClusterNode *out_n
      * -- logging each one would spam the log with no new information.
      * reconcile_and_publish() already prints whenever something actually
      * changes, which is the signal worth surfacing here. */
-    parse_cluster_nodes_into(body, out_nodes, out_count, out_slot, /*verbose=*/0);
+    parse_cluster_nodes_into(body, ip, out_nodes, out_count, out_slot, /*verbose=*/0);
     free(resp);
     return 0;
 }
@@ -240,19 +260,25 @@ void fetch_cluster_nodes(void) {
      * feature existed. */
     g_node_count = 0;
     memset(g_slot_map, -1, sizeof(g_slot_map));
-    parse_cluster_nodes_into(body, g_nodes, &g_node_count, g_slot_map, /*verbose=*/1);
-    free(resp);
+    parse_cluster_nodes_into(body, g_config.server_ip, g_nodes, &g_node_count, g_slot_map, /*verbose=*/1);
     memset(g_node_gen, 0, sizeof(g_node_gen));
     memset(g_node_has_slots, 0, sizeof(g_node_has_slots));
     for (int s = 0; s < CLUSTER_SLOTS; s++)
         if (g_slot_map[s] >= 0) g_node_has_slots[g_slot_map[s]] = 1;
     atomic_store_explicit(&g_topology_version, 1, memory_order_release);
 
+    if (g_node_count == 0) {
+        fprintf(stderr, "CLUSTER NODES from %s:%d lists no usable master:\n%s\n", g_config.server_ip,
+                g_config.server_port, body);
+        free(resp);
+        exit(1);
+    }
     printf("Discovered %d cluster node(s):\n", g_node_count);
     for (int i = 0; i < g_node_count; i++)
         printf("  [%d] %s:%d  flags=%-24s %s\n", i, g_nodes[i].ip, g_nodes[i].port, g_nodes[i].flags,
                g_nodes[i].is_master ? "(master)" : "(replica)");
     printf("\n");
+    free(resp);
 }
 
 /* ── periodic topology refresh ──────────────────────────────────────── */

@@ -859,8 +859,8 @@ static int parse_len(const char *p, const char *end, long long *out) {
 /* Frames one RESP multibulk command at buf[0..len). Returns 1 when it's all
  * there (cmd/key point into buf, *total = its full size), 0 if more bytes
  * are needed (*need = a lower bound on the total), -1 on a protocol error. */
-static int scan_command(const char *buf, int len, const char **cmd, int *cmdlen, const char **key, int *keylen,
-                        int *argc_out, long long *total, long long *need) {
+int scan_command(const char *buf, int len, const char **cmd, int *cmdlen, const char **key, int *keylen, int *argc_out,
+                 long long *total, long long *need) {
     *need = len + 1;
     if (buf[0] != '*') return -1;
     const char *nl = memchr(buf, '\n', (size_t)len);
@@ -947,7 +947,7 @@ static int hexval(char ch) {
  * c->conv, splitting on whitespace with Valkey's quoting rules ("..." with
  * \n \r \t \b \a \\ \" \xHH escapes, '...' with \' only). Returns the RESP
  * length, 0 for a blank line, or -1 on unbalanced quotes / OOM. */
-static int inline_to_resp(ClientConn *c, const char *line, int len) {
+int inline_to_resp(ClientConn *c, const char *line, int len) {
     char *args = malloc((size_t)len + 1); /* unescaped args are never longer than the line */
     if (!args) return -1;
     int arg_off[1024], arg_len[1024], argc = 0, alen = 0;

@@ -396,6 +396,8 @@ int backend_connect_blocking(const char *ip, int port, const struct sockaddr_sto
             return -1;
         }
     }
+#else
+    (void)tls_host;
 #endif
     return fd;
 }
