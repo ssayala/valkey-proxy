@@ -1,5 +1,20 @@
 # valkey-proxy
 
+> [!CAUTION]
+> **Experimental personal fork. Do not use it in production.**
+>
+> - It's forked from [valkey-io/valkey-proxy](https://github.com/valkey-io/valkey-proxy) at
+>   commit `31f9526` (October 2026). It isn't affiliated with or endorsed by the Valkey project.
+>   For a supported proxy, use the official repository.
+> - **Much of the code was written with AI assistance** ([Claude Code](https://claude.com/claude-code)).
+>   That includes the backend data path, TLS, the reliability fixes and the test suites. About
+>   4,000 lines of the original ~10,000-line C source were added or replaced.
+> - The two codebases have diverged. Behavior, configuration options and defaults may differ from
+>   upstream, so upstream documentation and fixes may not apply here.
+> - It may change or break at any time, with no releases, stability guarantees or migration path.
+> - **No contributions or support.** Pull requests won't be accepted and issues won't be answered.
+>   Don't report problems with this fork to the Valkey project either.
+
 A non-blocking, multi-threaded proxy for Valkey/Redis Cluster written in C. It routes commands to the correct shard based on CRC16 key hashing, follows `MOVED`/`ASK` redirects transparently, and fans out multi-key commands across nodes.
 
 Plain single-key commands from all clients of a worker thread are pipelined over one shared connection per backend node, so client pipelining (`valkey-benchmark -P 16`, client-library pipelines) is fully supported, and replies always come back in command order. `MULTI`/`EXEC`/`WATCH` run on a connection pinned to the client for the duration of the transaction, and inline (telnet-style) commands are accepted.
