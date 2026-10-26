@@ -9,7 +9,7 @@ POOL_CFLAGS  += -DUSE_TLS -I$(OPENSSL_PREFIX)/include
 POOL_LDFLAGS += -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
 endif
 
-# Sanitizer builds for testing (always "make clean" when switching):
+# Sanitizer builds for testing:
 #   make SANITIZE=address,undefined    memory errors, leaks, undefined behavior
 #   make SANITIZE=thread               data races between threads
 ifneq ($(SANITIZE),)
@@ -24,6 +24,12 @@ POOL_SRCS   = src/valkey-proxy.c src/config.c src/cluster.c src/resp.c \
 BUILD_DIR   = build
 POOL_OBJS   = $(POOL_SRCS:%.c=$(BUILD_DIR)/%.o)
 
+# Everything is rebuilt when the compiler flags change (switching SANITIZE=,
+# NO_TLS=, ...), so objects built with different flags never get mixed.
+FLAGS_STAMP := $(BUILD_DIR)/.flags
+FLAGS_NOW   := $(POOL_CC) $(POOL_CFLAGS) $(POOL_LDFLAGS)
+$(shell mkdir -p $(BUILD_DIR); echo '$(FLAGS_NOW)' | cmp -s - $(FLAGS_STAMP) || echo '$(FLAGS_NOW)' > $(FLAGS_STAMP))
+
 # Print a short "CC <file>" line per step; run "make V=1" to see full commands
 ifeq ($(V),1)
 Q =
@@ -31,13 +37,13 @@ else
 Q = @
 endif
 
-$(POOL_TARGET): $(POOL_OBJS)
+$(POOL_TARGET): $(POOL_OBJS) $(FLAGS_STAMP)
 	@echo "    LINK $@"
 	$(Q)$(POOL_CC) -o $@ $(POOL_OBJS) $(POOL_LDFLAGS)
 
 # -MMD -MP tracks header dependencies, including the el_*.c files that
 # event_loop.c #include's
-$(BUILD_DIR)/%.o: %.c
+$(BUILD_DIR)/%.o: %.c $(FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	@echo "    CC   $<"
 	$(Q)$(POOL_CC) $(POOL_CFLAGS) -MMD -MP -c $< -o $@
@@ -84,8 +90,39 @@ $(TEST_OBJS): $(BUILD_DIR)/%.o: %.c
 # Usage: make test && ./run-test -h=<host> -p=<port>
 test: run-test
 
+# ── unit tests (no server needed) ────────────────────────────────────────
+# Built with the proxy's own flags and objects (SANITIZE= applies), minus
+# main(): valkey-proxy.c is compiled a second time with main renamed.
+UNIT_TARGET = unit-test
+UNIT_OBJS   = $(filter-out $(BUILD_DIR)/src/valkey-proxy.o,$(POOL_OBJS)) \
+              $(BUILD_DIR)/unit/valkey-proxy-nomain.o $(BUILD_DIR)/test/unit/test_unit.o
+
+$(UNIT_TARGET): $(UNIT_OBJS) $(FLAGS_STAMP)
+	@echo "    LINK $@"
+	$(Q)$(POOL_CC) -o $@ $(UNIT_OBJS) $(POOL_LDFLAGS)
+
+$(BUILD_DIR)/unit/valkey-proxy-nomain.o: src/valkey-proxy.c $(FLAGS_STAMP)
+	@mkdir -p $(dir $@)
+	@echo "    CC   $< (no main)"
+	$(Q)$(POOL_CC) $(POOL_CFLAGS) -Dmain=valkey_proxy_main -MMD -MP -c $< -o $@
+
+-include $(BUILD_DIR)/unit/valkey-proxy-nomain.d $(BUILD_DIR)/test/unit/test_unit.d
+
+test-unit: $(UNIT_TARGET)
+	./$(UNIT_TARGET)
+
+# ── integration tests (starts its own Valkey clusters) ──────────────────
+# Needs python3 and a valkey-server: $$VALKEY_SERVER, or a pinned release
+# built once into test/.deps (see "Tests" in README.md).
+#   make test-integration                      everything
+#   make test-integration ARGS="-k failover"   only matching tests
+test-integration: $(POOL_TARGET) run-test
+	python3 -u test/integration/run.py $(ARGS)
+
+test-all: test-unit test-integration
+
 clean:
-	rm -f $(POOL_TARGET) run-test
+	rm -f $(POOL_TARGET) run-test $(UNIT_TARGET)
 	rm -rf $(BUILD_DIR)
 
 # ── formatting ───────────────────────────────────────────────────────────
@@ -97,5 +134,5 @@ format:
 format-check:
 	clang-format --dry-run --Werror $(FORMAT_SRCS)
 
-.PHONY: clean test format format-check
+.PHONY: clean test test-unit test-integration test-all format format-check
 

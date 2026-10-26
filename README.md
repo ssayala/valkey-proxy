@@ -11,7 +11,7 @@ Requires GCC and (optionally) OpenSSL for TLS support. Supported on Linux, macOS
 ```bash
 make            # build → produces ./valkey-proxy
 make NO_TLS=1   # build without TLS support
-make SANITIZE=address,undefined   # testing: ASan + UBSan build (make clean first)
+make SANITIZE=address,undefined   # testing: ASan + UBSan build
 make SANITIZE=thread              # testing: ThreadSanitizer build
 make clean      # remove binary
 ```
@@ -110,9 +110,46 @@ tls-enabled  no
 ./valkey-proxy proxy.conf
 ```
 
-## Integration Tests
+## Tests
 
-Build the test runner once; then point it at any running proxy:
+```bash
+make test-unit            # unit tests: parsers, framing, config; no server needed, < 1s
+make test-integration     # starts its own Valkey clusters and proxies, ~3 minutes
+make test-all             # both
+```
+
+**Unit tests** (`test/unit/test_unit.c`) call the parsing code directly: client RESP framing
+and inline commands (including a seeded fuzz pass), backend reply framing, RESP3→RESP2
+conversion, key extraction, slot hashing, `CLUSTER NODES` parsing and config validation.
+
+**Integration tests** (`test/integration/`, Python 3 standard library only) start throwaway
+clusters on free local ports — plain, TLS, and with replicas — plus a proxy per test, and cover:
+
+| File | What |
+|---|---|
+| `test_suite.py` | the C command suite below (`./run-test`) against 1 and 4 workers, and all-TLS |
+| `test_protocol.py` | pipelining and reply order, framing, inline commands, transactions, errors, hostile input |
+| `test_lifecycle.py` | idle timeouts, graceful shutdown, `maxclients`, output-buffer limits, setup failures, config errors |
+| `test_cluster.py` | slot migration (ASK/MOVED), a master dying and coming back, replica failover under load |
+| `test_tls.py` | mTLS, handshake timeout, certificate reload, `tls-backend-verify-host` |
+
+They need `python3`, `openssl` and a `valkey-server`: set `VALKEY_SERVER=/path/to/valkey-server`,
+or leave it unset and the first run downloads a pinned Valkey release, checks its SHA-256 and
+builds it (with TLS) into `test/.deps/`. A `valkey-server` without TLS support skips the TLS tests.
+
+```bash
+make test-integration ARGS="-k failover"     # only tests whose name contains "failover"
+make test-integration ARGS="-x --keep"       # stop at the first failure; keep all logs
+make test-all SANITIZE=address,undefined     # everything against an ASan + UBSan build
+make test-all SANITIZE=thread                # ... a ThreadSanitizer build
+```
+
+With a sanitizer build, a test fails if the proxy's log contains a sanitizer report. When a test
+fails, the run keeps its temporary directory (every server and proxy log) and prints its path.
+
+### The C command suite
+
+The integration tests run it for you; to point it at a proxy of your own:
 
 ```bash
 make test                              # compiles → ./run-test
@@ -126,7 +163,7 @@ Example:
 ./run-test -h=192.168.1.200 -p=7777 --cluster=192.168.1.200:6379 # + AUTH / HELLO AUTH as real ACL users
 ```
 
-### Options
+#### Options
 
 | Option | Meaning |
 |---|---|
@@ -161,7 +198,7 @@ Total: Passed: 868, Failed: 0
 Exit code is `0` when all tests pass, `1` when any test fails. `[SKIP]` lines are not counted
 as either.
 
-### ACL user tests (`--cluster`)
+#### ACL user tests (`--cluster`)
 
 Tests for `AUTH user pass` and `HELLO <ver> AUTH user pass` need a non-default user that exists on
 **every** cluster node (ACLs are per node), and the proxy itself never forwards
@@ -182,7 +219,7 @@ Without `--cluster` those tests print `[SKIP]` and everything else runs as befor
 Ctrl-C) the two users are left behind; the next `--cluster` run resets and removes them, or
 remove them by hand with `ACL DELUSER tc-proxy-acl tc-proxy-acl-ro` on each node.
 
-### RESP3 ordering note
+#### RESP3 ordering note
 
 The `resp3` suite runs last on purpose: its first successful `HELLO 3` flips a process-wide,
 sticky "backend speaks RESP3" flag in the proxy, so every other suite runs against a proxy that has
@@ -190,7 +227,7 @@ never negotiated RESP3. For the same reason some RESP3 paths (e.g. the very firs
 `HELLO 3 AUTH ...`, which doubles as the RESP3 probe) are only really exercised on a **freshly
 started** proxy — restart it before a run to cover them.
 
-### Module tests
+#### Module tests
 
 Bloom Filter, JSON and Search tests are **not** included in the default run. They require the
 Bloom Filter module (RedisBloom/ValkeyBloom), the JSON module (RedisJSON/ValkeyJSON) and the

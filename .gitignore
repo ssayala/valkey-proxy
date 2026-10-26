@@ -1,3 +1,6 @@
 valkey-proxy
 run-test
 build/
+unit-test
+test/.deps/
+__pycache__/
